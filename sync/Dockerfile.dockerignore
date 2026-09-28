@@ -1,0 +1,27 @@
+# Exclusiones para `docker build -f sync/Dockerfile .` (contexto = raiz del repo).
+# BuildKit lee <Dockerfile>.dockerignore junto al Dockerfile; un .dockerignore en
+# sync/ NO aplicaria porque el contexto es la raiz.
+.git
+.github
+.env
+**/.env
+**/.env.*
+web
+infra
+validation
+db/seeds
+db/supabase_snapshot
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/venv
+sync/tests
+sync/excel
+sync/recovery
+*.md
+*.docx
+*.xlsx
+*.xlsm
+*.xml
+*.png

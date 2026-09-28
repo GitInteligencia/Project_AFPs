@@ -1,5 +1,8 @@
 """
-Sync SQL Server `Inteligencia_Producto_Dev` -> Supabase (`dim_ipd_*`, `ipd_*`).
+Sync SQL Server `Inteligencia_Producto_Dev` -> BigQuery (`dim_ipd_*` en afp_dim, `ipd_*` en afp_raw).
+
+Destino (2026-09, migracion GCP): BigQuery via sync/bq_io.py con ADC; antes
+Supabase REST. Estrategia por tabla intacta: DELETE all + INSERT (full reload).
 
 This DB is the Bloomberg/IPA Moneda internal pipeline. Tables we pull:
 
@@ -16,7 +19,7 @@ Tier C — time-series facts
   - metrics.TBL_JPM_CEMBI_AGG_METRICS (864 rows)
   - metrics.TBL_RISK_AMERICA_AGG_METRICS (1,332 rows)
 
-Connection: REST API over HTTPS/443 (corp firewall blocks 5432/6543).
+Connection: BigQuery API over HTTPS/443 (pasa el firewall corporativo igual que la REST de Supabase).
 
 Usage:
     python sync/sync_inteligencia_producto.py
@@ -25,15 +28,14 @@ Usage:
 import os
 import sys
 import urllib.parse
-from datetime import datetime, date
 from time import time
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-from tqdm import tqdm
-from supabase import create_client, Client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bq_io  # noqa: E402
 
 load_dotenv()
 
@@ -48,54 +50,29 @@ def connect_sqlserver():
     pwd = 'Patria2024####'
     database = 'Inteligencia_Producto_Dev'
 
+    # ODBC Driver 18 (Linux/Windows); Encrypt=optional + TrustServerCertificate
+    # como los demas syncs (el nombre "SQL Server" solo existe en Windows).
     odbc_str = (
-        f"DRIVER={{SQL Server}};"
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={server};"
         f"DATABASE={database};"
         f"UID={user};"
-        f"PWD={pwd}"
+        f"PWD={pwd};"
+        f"Encrypt=optional;"
+        f"TrustServerCertificate=yes;"
     )
     params = urllib.parse.quote_plus(odbc_str)
     return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
 
-def connect_supabase() -> Client:
-    url = os.getenv('SUPABASE_URL')
-    key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-    if not all([url, key]):
-        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
-    print(f"      url={url}")
-    return create_client(url, key)
+def connect_supabase():
+    """Wrapper de compatibilidad: devuelve un bigquery.Client (ADC)."""
+    return bq_io.connect_bigquery()
 
 
 # =============================================================
-# SERIALIZACION
+# HELPERS (wrappers finos sobre bq_io, misma firma que antes)
 # =============================================================
-
-def _serialize_value(v):
-    if v is None:
-        return None
-    if isinstance(v, float) and pd.isna(v):
-        return None
-    if isinstance(v, np.integer):
-        return int(v)
-    if isinstance(v, np.floating):
-        return float(v) if not np.isnan(v) else None
-    if isinstance(v, (datetime, date, pd.Timestamp)):
-        return v.isoformat() if hasattr(v, 'isoformat') else str(v)
-    if isinstance(v, np.bool_):
-        return bool(v)
-    return v
-
-
-def _df_to_records(df):
-    df_clean = df.where(pd.notnull(df), None)
-    for col in df_clean.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_clean[col]):
-            df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%d')
-    records = df_clean.to_dict('records')
-    return [{k: _serialize_value(v) for k, v in row.items()} for row in records]
-
 
 def float_to_int(df, cols):
     """Convert pandas float cols (which have NaN-friendly storage) to nullable Int64."""
@@ -114,58 +91,21 @@ def timed_read(label, engine, query):
 
 
 def supabase_replace(client, table, df, batch_size=1000):
-    """DELETE all + INSERT in batches. For full-reload dim tables."""
-    # truncate
-    # supabase-py doesn't have truncate; use delete with always-true filter
-    client.table(table).delete().neq('does_not_exist_col', '___').execute() if False else None
-    # safer: use a column we know exists. Pick the first column.
+    """Full reload (load WRITE_TRUNCATE). For full-reload dim tables."""
     if df.empty:
-        print(f"      -> 0 filas (DataFrame vacio, skip)")
+        print("      -> 0 filas (DataFrame vacio, skip)")
         return 0
-    first_col = df.columns[0]
-    try:
-        # not-null trick: every row matches "first_col IS NOT NULL OR first_col IS NULL"
-        # supabase-py: use .neq with impossible value. We'll just match all via .gte('row_id', 0)
-        # cleanest: select the PK col + delete by IN. But simplest is to use a delete with no filter,
-        # which supabase-py rejects. Workaround: delete via .not_.is_(col, None) – matches everything.
-        client.table(table).delete().not_.is_(first_col, 'null').execute()
-    except Exception:
-        # If first_col is nullable, fall back to RPC-less approach: use OR
-        client.table(table).delete().gte('id', -1).execute()
-    return supabase_insert(client, table, df, batch_size=batch_size)
-
-
-def supabase_truncate(client, supabase_url, supabase_key, table):
-    """Use the REST API directly with a DELETE that has 'id IS NULL OR id IS NOT NULL'.
-
-    supabase-py requires a filter clause. Easiest: rely on the fact that every row has
-    a non-null first column → match with neq('1','2') logic, but supabase-py rejects.
-    Use the Python client's filter trick: .delete().neq('uuid_field', '')."""
-    raise NotImplementedError
+    return bq_io.bq_replace(client, table, df)
 
 
 def supabase_insert(client, table, df, batch_size=1000, show_progress=True):
-    if df.empty:
-        print(f"      -> 0 filas")
-        return 0
-    records = _df_to_records(df)
-    chunks = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
-    iterator = (
-        tqdm(chunks, desc=f"      insert {table}", unit="batch", leave=False)
-        if show_progress and len(chunks) > 1 else chunks
-    )
-    total = 0
-    for chunk in iterator:
-        client.table(table).insert(chunk).execute()
-        total += len(chunk)
-    return total
+    """INSERT (append) via load job parquet. batch_size/show_progress se ignoran."""
+    return bq_io.bq_insert(client, table, df, batch_size=batch_size, show_progress=show_progress)
 
 
 def supabase_delete_all(client, table, pk_col):
-    """Delete all rows. Uses a guaranteed-matching filter on pk_col."""
-    # We pick a filter that matches every row: pk_col IS NULL OR pk_col IS NOT NULL.
-    # supabase-py supports this via .or_()
-    client.table(table).delete().or_(f'{pk_col}.is.null,{pk_col}.not.is.null').execute()
+    """DELETE FROM tabla WHERE TRUE (pk_col se conserva por firma; no hace falta)."""
+    return bq_io.bq_delete_all(client, table)
 
 
 # =============================================================
@@ -492,7 +432,7 @@ def sync_risk_america_metrics(ms, sb):
 
 def main():
     print("=" * 60)
-    print("Sync Inteligencia_Producto_Dev -> Supabase")
+    print("Sync Inteligencia_Producto_Dev -> BigQuery")
     print("=" * 60)
 
     ms = connect_sqlserver()

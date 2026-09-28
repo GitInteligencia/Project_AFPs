@@ -1,9 +1,14 @@
 """
-Sync SQL Server (Inteligencia_Mercado, DW_MONEDA) -> Supabase Postgres (ProjectAFP)
+Sync SQL Server (Inteligencia_Mercado, DW_MONEDA) -> BigQuery (pat-uat-global)
 
-ARQUITECTURA: Usa la REST API de Supabase (HTTPS/443) en vez de conexion directa
-de Postgres porque la red corporativa de Patria bloquea los puertos 5432/6543.
-HTTPS pasa sin restriccion.
+DESTINO (2026-09, migracion GCP): el destino ya NO es Supabase sino BigQuery
+(datasets afp_raw / afp_dim; ver PLAN_MIGRACION_GCP.md). El nombre del archivo
+se conserva porque los demas syncs importan de aqui los helpers compartidos
+(connect_sqlserver / connect_supabase / supabase_upsert / supabase_insert /
+supabase_delete_in / get_last_date / timed_read). Esos helpers conservan su
+firma y son wrappers finos sobre sync/bq_io.py, que hace la escritura real
+(load jobs parquet + MERGE). Autenticacion GCP por ADC (nunca llaves JSON).
+BigQuery va por HTTPS/443, asi que pasa por la red corporativa igual que antes.
 
 MODOS DE EJECUCION
 ==================
@@ -17,37 +22,40 @@ MODOS DE EJECUCION
 
        python sync_sqlserver_to_supabase.py
 
-   Detecta automaticamente la fecha maxima en cada tabla raw de Supabase
+   Detecta automaticamente la fecha maxima en cada tabla raw de BigQuery
    y carga desde ahi (re-procesa el ultimo mes para capturar correcciones).
    Si la tabla esta vacia, cae al cutoff por defecto (2020-01-01).
 
 ESTRATEGIA POR TABLA
 ====================
   - historial_carteras:        DELETE por fecha_reporte (solo fechas en el nuevo data) + INSERT
-  - valores_cuota_patrimonio:  UPSERT sobre PK (fecha, multifondo, afp)
-  - tipo_cambio:               UPSERT sobre PK (solo CLFXDOOB_sindesf)
-  - dim_*:                     UPSERT full reload
-  - dim_valorizacion_remanente: skip (cargada manualmente)
+  - valores_cuota_patrimonio:  UPSERT (MERGE) sobre PK (fecha, multifondo, afp)
+  - tipo_cambio:               UPSERT (MERGE) sobre PK (solo CLFXDOOB_sindesf)
+  - dim_*:                     UPSERT (MERGE) full reload
+  - dim_valorizacion_remanente: skip (seed manual, db/seeds)
+  Al final se reconstruyen los marts de Alternatives (bq_io.ALTERNATIVES_MARTS),
+  equivalente al antiguo RPC refresh_alternatives_matviews().
 
 VARIABLES REQUERIDAS EN .env
 ============================
   DB_SERVER, DB_DATABASE, DB_UID, DB_PWD            (SQL Server)
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY            (Supabase REST API)
+  GCP_PROJECT_ID, BQ_LOCATION (opcionales; defaults en sync/bq_io.py) + ADC
 """
 
 import os
 import sys
 import argparse
 import urllib.parse
-from datetime import datetime, date
+from datetime import datetime
 from time import time
 
-import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
-from tqdm import tqdm
-from supabase import create_client, Client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bq_io  # noqa: E402
+from bq_io import ALTERNATIVES_MARTS, refresh_marts  # noqa: E402,F401
 
 load_dotenv()
 
@@ -66,55 +74,30 @@ def connect_sqlserver():
     if not all([server, database, user, pwd]):
         raise RuntimeError("Faltan variables DB_* en .env")
 
+    # ODBC Driver 18 (Linux/Windows); Encrypt=optional + TrustServerCertificate
+    # como los demas syncs (el nombre "SQL Server" solo existe en Windows).
     odbc_str = (
-        f"DRIVER={{SQL Server}};"
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={server};"
         f"DATABASE={database};"
         f"UID={user};"
-        f"PWD={pwd}"
+        f"PWD={pwd};"
+        f"Encrypt=optional;"
+        f"TrustServerCertificate=yes;"
     )
     params = urllib.parse.quote_plus(odbc_str)
     return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
 
-def connect_supabase() -> Client:
-    url = os.getenv('SUPABASE_URL')
-    key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-    if not all([url, key]):
-        raise RuntimeError("Faltan variables SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
-    print(f"      url={url}")
-    return create_client(url, key)
+def connect_supabase():
+    """Wrapper de compatibilidad: devuelve un bigquery.Client (ADC). El nombre se
+    conserva para no tocar los imports de los demas scripts."""
+    return bq_io.connect_bigquery()
 
 
 # =============================================================
-# HELPERS DE SERIALIZACION Y ESCRITURA
+# HELPERS DE ESCRITURA (wrappers finos sobre bq_io, misma firma que antes)
 # =============================================================
-
-def _serialize_value(v):
-    """Convierte un valor pandas/numpy/python a JSON-serializable."""
-    if v is None:
-        return None
-    if isinstance(v, float) and pd.isna(v):
-        return None
-    if isinstance(v, np.integer):
-        return int(v)
-    if isinstance(v, np.floating):
-        return float(v) if not np.isnan(v) else None
-    if isinstance(v, (datetime, date, pd.Timestamp)):
-        return v.isoformat() if hasattr(v, 'isoformat') else str(v)
-    return v
-
-
-def _df_to_records(df):
-    """DataFrame -> lista de dicts JSON-ready."""
-    df_clean = df.where(pd.notnull(df), None)
-    # Datetime columns -> string ISO
-    for col in df_clean.columns:
-        if pd.api.types.is_datetime64_any_dtype(df_clean[col]):
-            df_clean[col] = df_clean[col].dt.strftime('%Y-%m-%d')
-    records = df_clean.to_dict('records')
-    return [{k: _serialize_value(v) for k, v in row.items()} for row in records]
-
 
 def timed_read(label, engine, query):
     print(f"      leyendo de SQL Server ({label})...", flush=True)
@@ -125,64 +108,20 @@ def timed_read(label, engine, query):
 
 
 def supabase_upsert(client, table, df, on_conflict, batch_size=1000, show_progress=False):
-    if df.empty:
-        print(f"      -> 0 filas (DataFrame vacio)")
-        return 0
-
-    # Dedupe en el conflict key (Postgres rechaza si un batch tiene la misma
-    # combinacion repetida dentro de un solo statement)
-    conflict_list = (
-        on_conflict if isinstance(on_conflict, list)
-        else [c.strip() for c in on_conflict.split(',')]
-    )
-    pre = len(df)
-    df = df.drop_duplicates(subset=conflict_list, keep='last')
-    if len(df) < pre:
-        print(f"      ({pre - len(df)} duplicados removidos en {conflict_list})")
-
-    records = _df_to_records(df)
-    chunks = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
-    on_conflict_str = ','.join(conflict_list)
-
-    iterator = (
-        tqdm(chunks, desc=f"      upserting", unit="batch", leave=False)
-        if show_progress and len(chunks) > 1
-        else chunks
-    )
-    total = 0
-    for chunk in iterator:
-        client.table(table).upsert(chunk, on_conflict=on_conflict_str).execute()
-        total += len(chunk)
-    return total
+    """UPSERT sobre la clave: dedupe en pandas (keep='last', como siempre) ->
+    staging afp_stg -> MERGE. batch_size/show_progress se ignoran (un load job)."""
+    return bq_io.bq_upsert(client, table, df, on_conflict,
+                           batch_size=batch_size, show_progress=show_progress)
 
 
 def supabase_insert(client, table, df, batch_size=1000, show_progress=False):
-    if df.empty:
-        print(f"      -> 0 filas")
-        return 0
-
-    records = _df_to_records(df)
-    chunks = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
-
-    iterator = (
-        tqdm(chunks, desc=f"      inserting", unit="batch", leave=False)
-        if show_progress and len(chunks) > 1
-        else chunks
-    )
-    total = 0
-    for chunk in iterator:
-        client.table(table).insert(chunk).execute()
-        total += len(chunk)
-    return total
+    """INSERT (append) via load job parquet. batch_size/show_progress se ignoran."""
+    return bq_io.bq_insert(client, table, df, batch_size=batch_size, show_progress=show_progress)
 
 
 def supabase_delete_in(client, table, col, values):
-    """DELETE WHERE col IN (values). values pueden ser dates."""
-    if not values:
-        return 0
-    values_str = [v.isoformat() if hasattr(v, 'isoformat') else str(v) for v in values]
-    response = client.table(table).delete().in_(col, values_str).execute()
-    return len(response.data) if response.data else 0
+    """DELETE WHERE col IN UNNEST(@values). values pueden ser dates. Devuelve filas borradas."""
+    return bq_io.bq_delete_in(client, table, col, values)
 
 
 # =============================================================
@@ -190,17 +129,8 @@ def supabase_delete_in(client, table, col, values):
 # =============================================================
 
 def get_last_date(client, table, col):
-    """SELECT MAX(col) FROM table  via REST API (order desc + limit 1)."""
-    response = (
-        client.table(table)
-        .select(col)
-        .order(col, desc=True)
-        .limit(1)
-        .execute()
-    )
-    if response.data:
-        return response.data[0][col]  # string YYYY-MM-DD
-    return None
+    """SELECT MAX(col) FROM table. Devuelve string YYYY-MM-DD o None."""
+    return bq_io.get_last_date(client, table, col)
 
 
 def resolve_range(args, client, table, col):
@@ -511,7 +441,7 @@ def sync_historial_carteras(ms_engine, client, args):
     df = df[cols_order]
 
     fechas_a_reemplazar = sorted(df['fecha_reporte'].unique().tolist())
-    print(f"      borrando {len(fechas_a_reemplazar)} fechas previas en Supabase...", flush=True)
+    print(f"      borrando {len(fechas_a_reemplazar)} fechas previas en BigQuery...", flush=True)
     deleted = supabase_delete_in(client, 'historial_carteras', 'fecha_reporte', fechas_a_reemplazar)
     print(f"      ({deleted:,} filas borradas)")
 
@@ -524,7 +454,7 @@ def sync_historial_carteras(ms_engine, client, args):
 # =============================================================
 
 def print_summary(client):
-    print("\n--- Resumen Supabase ---")
+    print("\n--- Resumen BigQuery ---")
     tables = [
         # ('historial_carteras', 'fecha_reporte'),  # RETIRADA 2026-06-26 (dropeada; ver main)
         ('valores_cuota_patrimonio', 'fecha'),
@@ -545,15 +475,13 @@ def print_summary(client):
         ('dim_rel_feeder_master', None),
     ]
     for table, fecha_col in tables:
-        # count exact (sin head=True; usamos limit(1) para minimizar el payload)
-        resp = client.table(table).select('*', count='exact').limit(1).execute()
-        count = resp.count or 0
-        rng = ""
-        if fecha_col and count > 0:
-            asc = client.table(table).select(fecha_col).order(fecha_col, desc=False).limit(1).execute()
-            dsc = client.table(table).select(fecha_col).order(fecha_col, desc=True).limit(1).execute()
-            if asc.data and dsc.data:
-                rng = f" [{asc.data[0][fecha_col]} -> {dsc.data[0][fecha_col]}]"
+        # COUNT(*) + MIN/MAX(fecha) en una sola consulta por tabla
+        try:
+            count, mn, mx = bq_io.bq_table_stats(client, table, fecha_col)
+        except Exception as e:  # tabla aun no creada, etc.: no aborta el resumen
+            print(f"  {table:32s} {'?':>10} ({type(e).__name__})")
+            continue
+        rng = f" [{mn} -> {mx}]" if fecha_col and count > 0 else ""
         print(f"  {table:32s} {count:>10} filas{rng}")
 
 
@@ -563,7 +491,7 @@ def print_summary(client):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Sync SQL Server -> Supabase via REST API (HTTPS)',
+        description='Sync SQL Server -> BigQuery (load jobs + MERGE, ADC)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -587,7 +515,7 @@ def main():
 
     print("Conectando a SQL Server...")
     ms_engine = connect_sqlserver()
-    print("Conectando a Supabase REST API...")
+    print("Conectando a BigQuery (ADC)...")
     client = connect_supabase()
     print("Conexiones OK\n")
 
@@ -622,10 +550,12 @@ def main():
 
         # tipo_cambio / VC_PAT (+ BD dims) feed mv_aum and mv_chist_aa, the snapshots
         # behind v_aum / v_total / v_nav / v_uncalled. Refresh them so the dashboard
-        # reflects this sync instead of a stale snapshot.
-        print("\nRefrescando matviews del dashboard (mv_chist_aa, mv_aum)...")
-        client.rpc('refresh_alternatives_matviews').execute()
-        print("  -> matviews refrescados")
+        # reflects this sync instead of a stale snapshot. En BigQuery los mv_* son
+        # tablas reconstruidas desde db/bigquery/marts/*.sql (antes: RPC
+        # refresh_alternatives_matviews()).
+        print(f"\nReconstruyendo marts del dashboard ({', '.join(ALTERNATIVES_MARTS)})...")
+        done = refresh_marts(client, ALTERNATIVES_MARTS)
+        print(f"  -> marts reconstruidos: {', '.join(done)}")
     except Exception as e:
         print(f"\n[ERROR] {e}", file=sys.stderr)
         raise

@@ -1,7 +1,10 @@
 """
-Sync 4.1/4.2 Strategy: SQL Server Inteligencia_Producto (prod) -> Supabase.
+Sync 4.1/4.2 Strategy: SQL Server Inteligencia_Producto (prod) -> BigQuery.
 
-Opcion D (2026-07-01): el diario NUNCA toca Supabase. Este script:
+Destino (2026-09, migracion GCP): tablas ipd_* en afp_raw via sync/bq_io.py
+(load WRITE_TRUNCATE = full reload), ADC. Antes: Supabase REST.
+
+Opcion D (2026-07-01): el diario NUNCA toca el destino. Este script:
   1. Lee TBL_IPA_V2 diaria deduplicada (FechaReporte = FechaCartera) para los 7
      fondos Moneda de estrategia vivos: 13 MDLAT, 17 MLDL, 28 MSC, 34 MLE,
      52 MSCLUX, 59 MLATHY, 68 MLCC (Geneva).
@@ -38,15 +41,16 @@ Opcion D (2026-07-01): el diario NUNCA toca Supabase. Este script:
 Metodologia validada contra el piloto TBL_PERFORMANCE_ATTRIBUTION (MSCLUX
 2025-01-15: pesos identicos a 3 decimales, contribucion +-0.3-0.8 bps).
 
-Destino (Supabase): ipd_cartera_eom, ipd_attribution_monthly,
-ipd_attribution_fund_month, ipd_rentabilidades. Full reload (DELETE + INSERT).
+Destino (BigQuery afp_raw): ipd_cartera_eom, ipd_attribution_monthly,
+ipd_attribution_fund_month, ipd_rentabilidades, ipd_bms_membership. Full reload
+(load WRITE_TRUNCATE; antes DELETE + INSERT).
 
 Usage:
     python sync/sync_ipd_strategy.py
 """
 
-import json
 import os
+import sys
 import urllib.parse
 from time import time
 
@@ -54,7 +58,9 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from supabase import create_client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bq_io import bq_replace, connect_bigquery  # noqa: E402
 
 load_dotenv()
 
@@ -101,24 +107,14 @@ def connect_sqlserver():
 
 
 def connect_supabase():
-    url = os.getenv('SUPABASE_URL')
-    key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
-    if not all([url, key]):
-        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
-    return create_client(url, key)
+    """Wrapper de compatibilidad: devuelve un bigquery.Client (ADC)."""
+    return connect_bigquery()
 
 
 def supabase_replace(sb, table, df, pk_col, batch_size=500):
-    """Full reload: DELETE all + INSERT por lotes."""
-    sb.table(table).delete().or_(f'{pk_col}.is.null,{pk_col}.not.is.null').execute()
-    if df.empty:
-        print(f"      -> {table}: 0 filas")
-        return
-    # to_json maneja numpy types y NaN -> null
-    records = json.loads(df.to_json(orient='records', date_format='iso'))
-    for i in range(0, len(records), batch_size):
-        sb.table(table).insert(records[i:i + batch_size]).execute()
-    print(f"      -> {table}: {len(records):,} filas")
+    """Full reload: load WRITE_TRUNCATE (antes DELETE all + INSERT por lotes).
+    pk_col/batch_size se conservan por firma; bq_replace los ignora."""
+    return bq_replace(sb, table, df, pk_col)
 
 
 # =============================================================
@@ -358,7 +354,7 @@ def build_cartera_eom(pos):
 
 def main():
     print("=" * 60)
-    print("Sync 4.1/4.2 Strategy: Inteligencia_Producto -> Supabase")
+    print("Sync 4.1/4.2 Strategy: Inteligencia_Producto -> BigQuery")
     print("=" * 60)
     ms = connect_sqlserver()
     sb = connect_supabase()
@@ -400,7 +396,7 @@ def main():
                        'currency', 'source', 'investment_type_code',
                        'qty', 'local_price', 'mval_usd', 'weight']]
 
-    print("\n  subiendo a Supabase (full reload)...")
+    print("\n  subiendo a BigQuery (full reload)...")
     supabase_replace(sb, 'ipd_attribution_monthly', attr, 'row_id')
     supabase_replace(sb, 'ipd_attribution_fund_month', fund_month, 'id_fund')
     supabase_replace(sb, 'ipd_cartera_eom', cartera, 'row_id')

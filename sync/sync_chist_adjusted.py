@@ -1,5 +1,5 @@
 """
-Sync del detalle de cartera CON desfase (por AFP, pre-clasificado) SQL Server -> Supabase:
+Sync del detalle de cartera CON desfase (por AFP, pre-clasificado) SQL Server -> BigQuery:
   Inteligencia_Mercado.dbo.AFP_CL_CHIST_ADJUSTED  ->  chist_adjusted
 
 Unico nivel con detalle por-AFP x instrumento. `supracategory` ya viene clasificada;
@@ -8,6 +8,8 @@ Unico nivel con detalle por-AFP x instrumento. `supracategory` ya viene clasific
 Ventana 2025+ y EXCLUSION de buckets (free tier): Direct Inv. RF Nacional, Derivados
 Nacional/Extranjero, Disponible Nacional -> sus totales salen de sd_asset_class_*.
 Columnas forward/swap no se traen. Idempotente: DELETE por fecha en el pull + INSERT.
+Destino BigQuery (afp_raw) via sync/bq_io.py con ADC (antes: Supabase REST); al final
+reconstruye los marts de Alternatives (antes: RPC refresh_alternatives_matviews()).
 
 Requiere que la tabla destino exista (ver chist_adjusted_schema.sql).
 
@@ -39,6 +41,7 @@ from sync_sqlserver_to_supabase import (  # noqa: E402
     supabase_delete_in,
     timed_read,
 )
+from bq_io import ALTERNATIVES_MARTS, bq_count, refresh_marts  # noqa: E402
 
 load_dotenv()
 
@@ -97,10 +100,10 @@ def resolve_start(eng, arg_start):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Sync AFP_CL_CHIST_ADJUSTED -> Supabase chist_adjusted")
+    ap = argparse.ArgumentParser(description="Sync AFP_CL_CHIST_ADJUSTED -> BigQuery chist_adjusted")
     ap.add_argument('--start', default=None,
                     help='Inicio YYYY-MM-DD por fecha (default: auto, ultimos 3 meses publicados en la fuente)')
-    ap.add_argument('--dry-run', action='store_true', help='Solo lee de SQL y reporta; no escribe en Supabase')
+    ap.add_argument('--dry-run', action='store_true', help='Solo lee de SQL y reporta; no escribe en BigQuery')
     args = ap.parse_args()
 
     eng = connect_sqlserver()
@@ -117,7 +120,7 @@ def main():
     print("      tipo_valor:    " + ", ".join(f"{k}={v}" for k, v in df['tipo_valor'].value_counts().items()))
 
     if args.dry_run:
-        print("      DRY-RUN: no se escribe nada en Supabase.")
+        print("      DRY-RUN: no se escribe nada en BigQuery.")
         return
 
     sb = connect_supabase()
@@ -126,14 +129,15 @@ def main():
     n = supabase_insert(sb, DST_TABLE, df, batch_size=500, show_progress=True)
     print(f"      -> {n:,} filas insertadas")
 
-    got = sb.table(DST_TABLE).select('fila_id', count='exact').limit(1).execute()
-    print(f"      verificacion: {got.count:,} filas en Supabase (esperado >= {len(df):,})")
+    got = bq_count(sb, DST_TABLE)
+    print(f"      verificacion: {got:,} filas en BigQuery (esperado >= {len(df):,})")
 
     # chist_adjusted feeds mv_chist_aa (snapshot behind v_total/v_nav/v_uncalled/...).
     # Refresh it so the dashboard doesn't read stale alternatives after this sync.
-    print("      refrescando matviews del dashboard (mv_chist_aa, mv_aum)...")
-    sb.rpc('refresh_alternatives_matviews').execute()
-    print("      -> matviews refrescados")
+    # En BigQuery los mv_* son tablas reconstruidas desde db/bigquery/marts/*.sql.
+    print(f"      reconstruyendo marts del dashboard ({', '.join(ALTERNATIVES_MARTS)})...")
+    done = refresh_marts(sb, ALTERNATIVES_MARTS)
+    print(f"      -> marts reconstruidos: {', '.join(done)}")
     print("\n=== DONE ===")
 
 

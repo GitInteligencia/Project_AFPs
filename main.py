@@ -1,9 +1,24 @@
 """
-Orquestador mensual del pipeline de datos del dashboard: SQL Server -> Supabase.
+Orquestador mensual del pipeline de datos del dashboard: SQL Server -> BigQuery.
+
+DESTINO (2026-09, migracion GCP): BigQuery, proyecto pat-uat-global
+(datasets afp_raw / afp_dim; marts mv_* en afp_mart; ver PLAN_MIGRACION_GCP.md).
+Antes el destino era Supabase; los scripts conservan su nombre de archivo y su
+logica de lectura/ventanas, solo cambio la capa de escritura (sync/bq_io.py).
+
+DONDE CORRE: como Cloud Run Job (imagen sync/Dockerfile, disparada por Cloud
+Scheduler o por el workflow run-sync.yml) o en cualquier maquina con acceso al
+SQL Server y credenciales ADC de GCP (gcloud auth application-default login).
+Nunca llaves JSON. `python main.py --list` no necesita GCP.
+
+OBSERVABILIDAD: cada paso escribe una fila en afp_ops.run_log (inicio, fin, rc)
+via bq_io.log_run; si no hay credenciales ADC se avisa y se sigue. Al final, si
+WEB_URL y REVALIDATE_TOKEN estan definidos, se hace POST {WEB_URL}/api/revalidate
+(header x-revalidate-token) para invalidar el cache de la web; error no fatal.
 
 Los scrapers de spensiones.cl quedaron RETIRADOS (2026-07): las tablas fuente
 en SQL Server las mantiene el equipo con sus propios procesos. Este script
-solo espeja SQL Server -> Supabase, y es UN solo comando:
+solo espeja SQL Server -> BigQuery, y es UN solo comando:
 
     python main.py
 
@@ -15,17 +30,17 @@ falto. En particular CHIST llega con ~4 meses de rezago: su paso ancla la
 ventana al MAX(fecha) de la propia fuente (ultimos 3 meses publicados), asi
 que apenas el equipo cargue el mes nuevo en SQL, la siguiente corrida lo toma.
 
-  paso             fuente SQL Server                   destino Supabase
+  paso             fuente SQL Server                   destino BigQuery
   ---------------  ----------------------------------  -----------------------
   cotizantes       AFP_CL_Cotizantes                   cotizantes_afp
   core             dims + FX + VC_PAT                  dim_* / tipo_cambio /
                                                        valores_cuota_patrimonio
-                                                       (+ refresh matviews)
+                                                       (+ rebuild marts mv_*)
   sd_asset_class   AFP_CL_01_sd / 02_sd                sd_asset_class_*
   consolidated_sd  AFP_CL_09_17_25_sd_consolidated     consolidated_sd
   chist_adjusted   AFP_CL_CHIST_ADJUSTED               chist_adjusted (ventana
                                                        auto-anclada a la fuente;
-                                                       + refresh matviews)
+                                                       + rebuild marts mv_*)
   bbg_returns      AFP_CL_BBG_Returns                  bbg_returns
   dim_bd_previa    DIM_BD_Previa_AFPCL                 dim_bd_previa
   ipd_strategy     TBL_IPA_V2                          ipd_* (full reload, lo
@@ -47,14 +62,66 @@ Uso:
     python main.py --keep-going        # no se detiene en el primer fallo
 """
 import argparse
+import os
 import subprocess
 import sys
 import time
-from datetime import date
+import uuid
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SYNC_DIR = ROOT / 'sync'
+
+# .env local (WEB_URL, REVALIDATE_TOKEN, GCP_PROJECT_ID...). En Cloud Run llegan por env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / '.env')
+except ImportError:  # dotenv no es imprescindible para --list
+    pass
+
+
+# =============================================================
+# RUN LOG (afp_ops.run_log) y REVALIDACION DE LA WEB
+# =============================================================
+
+def connect_run_log():
+    """Cliente BigQuery para afp_ops.run_log. Si no hay credenciales ADC (o no
+    esta instalada la libreria) devuelve None con un aviso: el pipeline sigue."""
+    try:
+        sys.path.insert(0, str(SYNC_DIR))
+        import bq_io
+        client = bq_io.connect_bigquery()
+        return client
+    except Exception as e:
+        print(f'[warn] run_log deshabilitado (sin BigQuery/ADC): {type(e).__name__}: {e}')
+        return None
+
+
+def write_run_log(client, run_id, name, started, finished, rc, extra=None):
+    """Una fila por paso; cualquier error se reporta y no interrumpe."""
+    if client is None:
+        return
+    try:
+        import bq_io
+        bq_io.log_run(client, name, started, finished, rc,
+                      extra={'run_id': run_id, **(extra or {})})
+    except Exception as e:
+        print(f'[warn] run_log no escrito para [{name}]: {e}')
+
+
+def revalidate_web():
+    """POST {WEB_URL}/api/revalidate con x-revalidate-token (D5). No fatal."""
+    url, token = os.getenv('WEB_URL'), os.getenv('REVALIDATE_TOKEN')
+    if not (url and token):
+        return
+    endpoint = f"{url.rstrip('/')}/api/revalidate"
+    try:
+        import requests
+        r = requests.post(endpoint, headers={'x-revalidate-token': token}, timeout=30)
+        print(f'\nRevalidacion web: POST {endpoint} -> {r.status_code}')
+    except Exception as e:
+        print(f'\n[warn] revalidacion web fallo ({endpoint}): {e}')
 
 
 def default_start(months_back: int) -> str:
@@ -72,15 +139,15 @@ def build_steps(start: str, explicit_start: str):
     ancla la ventana al MAX(fecha) de su fuente (CHIST rezaga ~4 meses; una
     ventana relativa a hoy quedaria por delante del dato y cargaria 0 filas)."""
     chist_cmd = ['sync_chist_adjusted.py']
-    chist_desc = 'AFP_CL_CHIST_ADJUSTED -> chist_adjusted (ventana auto: ultimos 3 meses publicados, + refresh matviews)'
+    chist_desc = 'AFP_CL_CHIST_ADJUSTED -> chist_adjusted (ventana auto: ultimos 3 meses publicados, + rebuild marts)'
     if explicit_start:
         chist_cmd += ['--start', explicit_start]
-        chist_desc = f'AFP_CL_CHIST_ADJUSTED -> chist_adjusted (fecha >= {explicit_start}, + refresh matviews)'
+        chist_desc = f'AFP_CL_CHIST_ADJUSTED -> chist_adjusted (fecha >= {explicit_start}, + rebuild marts)'
     return [
         ('cotizantes', ['sync_sp_sqlserver_to_supabase.py'],
          'AFP_CL_Cotizantes -> cotizantes_afp (ventana >= 2025-01)'),
         ('core', ['sync_sqlserver_to_supabase.py'],
-         'Dims + tipo_cambio + valores_cuota_patrimonio, incremental (+ refresh matviews)'),
+         'Dims + tipo_cambio + valores_cuota_patrimonio, incremental (+ rebuild marts)'),
         ('sd_asset_class', ['sync_sd_asset_class.py', '--start', start],
          f'AFP_CL_01_sd/02_sd -> sd_asset_class_* (fecha >= {start})'),
         ('consolidated_sd', ['sync_consolidated_sd.py', '--start', start],
@@ -97,7 +164,7 @@ def build_steps(start: str, explicit_start: str):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Orquestador mensual: syncs SQL Server -> Supabase',
+        description='Orquestador mensual: syncs SQL Server -> BigQuery',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -139,11 +206,20 @@ def main():
     if args.list:
         return 0
 
+    # run_id agrupa las filas de esta corrida en afp_ops.run_log; los subprocesos
+    # lo reciben por env (AFP_RUN_ID) por si quieren loguear algo propio.
+    run_id = os.getenv('AFP_RUN_ID') or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex[:6]
+    os.environ['AFP_RUN_ID'] = run_id
+    print(f'run_id: {run_id}')
+    log_client = connect_run_log()
+
     results = []   # (name, status, seconds)
     failed = False
     for name, cmd, _desc in steps:
         if failed and not args.keep_going:
             results.append((name, 'SKIP', 0.0))
+            now = datetime.now(timezone.utc)
+            write_run_log(log_client, run_id, name, now, now, None, {'status': 'SKIP'})
             continue
         full_cmd = [sys.executable, str(SYNC_DIR / cmd[0]), *cmd[1:]]
         print(f'\n>>> [{name}] {" ".join(full_cmd[1:])}')
@@ -152,6 +228,8 @@ def main():
         dt = time.time() - t0
         status = 'OK' if rc == 0 else f'FAIL (rc={rc})'
         results.append((name, status, dt))
+        write_run_log(log_client, run_id, name, t0, t0 + dt, rc,
+                      {'args': cmd[1:], 'start': start})
         if rc != 0:
             failed = True
             print(f'\n[ERROR] paso [{name}] fallo con codigo {rc}'
@@ -167,6 +245,10 @@ def main():
         print(line)
     total = sum(dt for _, _, dt in results)
     print(f'  {"TOTAL":18s} {"":12s} {total:7.1f}s')
+
+    # Invalida Data Cache + ISR de la web si al menos un paso escribio algo.
+    if any(status == 'OK' for _, status, _ in results):
+        revalidate_web()
     return 1 if failed else 0
 
 
