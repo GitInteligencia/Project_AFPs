@@ -632,3 +632,10 @@ Siguen abiertas:
 - 2026-09-28 — Levantamiento completo del repo y redacción de este plan (rama `claude/migracion-gcp-9w4y80`). Pendiente: aprobación y cierre de D1–D7 para arrancar F0.
 - 2026-09-28 — Revisión del repo `IgnacioF1988/geneva` (app hermana en GCP): resueltas región y proyecto, conectividad on-prem confirmada inexistente, D1/D2/D7 reformuladas, F1 pasa a scripts idempotentes, ticket único a infra definido (§4.1).
 - 2026-09-28 — Decisiones del usuario: UAT (`pat-uat-global`), URLs por defecto de Cloud Run, sin VPN. D1 resuelta con Cloud NAT + IP fija e imagen portable. Arranca la ejecución: `sync/` → BigQuery, `web/` → BigQuery + Identity Platform + Docker, `db/bigquery/` + `validation/`, `infra/` + `.github/workflows/` + runbook.
+- 2026-09-28 — **Código de la migración construido y validado offline** (sin GCP en el entorno):
+  - F3 `sync/`: `bq_io.py`, 10 scripts sobre BigQuery, `main.py` con run_log + revalidate, `sync/Dockerfile`, 17 tests.
+  - F4 `web/`: `lib/db.ts`, 16 `queries*.ts` reescritos, auth Identity Platform, `/api/revalidate`, `Dockerfile`; `tsc` y `next build` limpios.
+  - F2 `db/bigquery/`: 41 tablas, 31 vistas y 6 marts traducidos, `apply.py` con `--parse-check` (78 SQL OK); pendientes de dump: 10 vistas, 9 marts, 4 funciones (`_PENDIENTES_DUMP.md`). `db/seeds/`, `db/supabase_snapshot/`, `validation/`.
+  - F1/F5 `infra/` + `.github/workflows/` + `docs/GCP_RUNBOOK.md`, README/HANDOFF actualizados.
+  - **Siguiente paso con credenciales**: F0 (dump Supabase + export de seeds + baseline), completar traducciones pendientes, `infra/diagnostico-iam.sh` → ticket a infra → `setup-afp.sh`, cargar secretos, allowlist IP NAT, backfill y paridad.
+

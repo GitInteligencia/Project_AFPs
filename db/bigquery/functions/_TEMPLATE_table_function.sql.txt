@@ -1,0 +1,31 @@
+-- Plantilla de table function BigQuery para las RPC f_sec05_* (copiar a f_sec05_<nombre>.sql).
+-- Origen Postgres: pg_get_functiondef('public.f_sec05_<nombre>(date)') en db/supabase_snapshot/schema.sql
+--   CREATE FUNCTION public.f_sec05_<nombre>(p_fecha date) RETURNS TABLE(...) LANGUAGE sql STABLE AS $$ ... $$;
+-- Reglas: mismo nombre, mismo parametro p_fecha DATE, mismas columnas en el mismo orden, tipos = Postgres
+--   (numeric -> NUMERIC, double precision -> FLOAT64, integer/bigint -> INT64, text -> STRING).
+CREATE OR REPLACE TABLE FUNCTION `${project}.${mart}.f_sec05_<nombre>`(p_fecha DATE)
+OPTIONS (description = 'RPC Sec05 <nombre> traducida de Supabase (f_sec05_<nombre>). Parametro: fecha objetivo del reporte.')
+AS (
+  -- Patron habitual de estas funciones: 1 fecha efectiva por fuente = ultima fecha <= p_fecha.
+  WITH f_pionero AS (
+    SELECT MAX(fecha) AS fecha FROM `${project}.${raw}.ipd_cartera_eom` WHERE id_fund = 33 AND fecha <= p_fecha
+  ),
+  f_mrv AS (
+    SELECT MAX(fecha) AS fecha FROM `${project}.${raw}.ipd_cartera_eom` WHERE id_fund = 19 AND fecha <= p_fecha
+  ),
+  f_ipsa AS (
+    SELECT MAX(fecha) AS fecha FROM `${project}.${raw}.ipd_bms_membership` WHERE fecha <= p_fecha
+  ),
+  f_afps AS (
+    SELECT MAX(fecha_reporte) AS fecha FROM `${project}.${mart}.v_chilean_stocks_gics` WHERE fecha_reporte <= p_fecha
+  )
+  -- TODO(dump): reemplazar por el cuerpo real traducido 1:1 (PLAN §7).
+  SELECT
+    CAST(NULL AS STRING)  AS bucket,
+    CAST(NULL AS FLOAT64) AS pionero_pct,
+    CAST(NULL AS FLOAT64) AS mrv_pct,
+    CAST(NULL AS FLOAT64) AS ipsa_pct,
+    CAST(NULL AS FLOAT64) AS afps_pct
+  FROM f_pionero, f_mrv, f_ipsa, f_afps
+  WHERE FALSE
+);
