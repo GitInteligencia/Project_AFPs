@@ -1,0 +1,81 @@
+# Deploy del pipeline (Cloud Run job afp-sync): build & push afp/sync:<sha> y
+# `gcloud run jobs deploy`. NO ejecuta el job (eso es run-sync.yml o el Scheduler).
+# Se dispara por cambios en el código del pipeline o en los marts que la imagen hornea.
+name: deploy-sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sync/**'
+      - 'main.py'
+      - 'db/bigquery/marts/**'
+      - '.github/workflows/deploy-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-sync
+  cancel-in-progress: false
+
+env:
+  JOB: afp-sync
+  AR_REPO: afp
+
+jobs:
+  deploy:
+    name: build & deploy afp-sync
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: build & push
+        id: image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/sync:${{ github.sha }}"
+          docker build -f sync/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # WEB_URL: la URL *.run.app de afp-web (el job llama POST $WEB_URL/api/revalidate al
+      # terminar, D5). Se lee del servicio desplegado; si aún no existe queda vacío y el
+      # job simplemente omite la revalidación.
+      - name: resolver WEB_URL
+        id: web
+        run: |
+          URL=$(gcloud run services describe afp-web --region "${{ vars.GCP_REGION }}" --format='value(status.url)' 2>/dev/null || true)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "WEB_URL=$URL"
+
+      # Recursos según PLAN §3.1 / precedente geneva: 2 vCPU / 4 GiB (ipd_strategy hace
+      # pandas pesado), 3 h de timeout, 0 reintentos (idempotente; se relanza a mano con
+      # --only). Egress por afp-vpc/afp-run-egress -> Cloud NAT con IP fija (D1 sin VPN).
+      - name: deploy job
+        run: |
+          gcloud run jobs deploy "$JOB" \
+            --image "${{ steps.image.outputs.image }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "afp-sync-run@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --cpu 2 --memory 4Gi --task-timeout 3h --max-retries 0 \
+            --network afp-vpc --subnet afp-run-egress --vpc-egress all-traffic \
+            --set-env-vars "GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},BQ_LOCATION=${{ vars.GCP_REGION }},WEB_URL=${{ steps.web.outputs.url }},TQDM_DISABLE=1,PYTHONUNBUFFERED=1" \
+            --set-secrets "DB_SERVER=afp-sqlserver-host:latest,DB_DATABASE=afp-sqlserver-db:latest,DB_UID=afp-sqlserver-uid:latest,DB_PWD=afp-sqlserver-pwd:latest,REVALIDATE_TOKEN=afp-web-revalidate-token:latest" \
+            --labels "app=afp-dashboard,env=uat,managed-by=afp-setup" \
+            --quiet
+          gcloud run jobs describe "$JOB" --region "${{ vars.GCP_REGION }}" \
+            --format='value(template.template.containers[0].image)' | sed 's/^/imagen desplegada: /' | tee -a "$GITHUB_STEP_SUMMARY"
