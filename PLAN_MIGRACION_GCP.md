@@ -179,7 +179,7 @@ Operadores PostgREST usados: `select/eq/gte/lte/gt/in/not/order/limit/range/mayb
 
 | ID | Decisión | Recomendación | Alternativas / implicancias |
 |---|---|---|---|
-| **D1** | Conectividad Cloud Run Job → SQL Server (red Patria) | **Actualizado con `geneva` (§4.1):** hoy **no existe** VPN/conector on-prem en `pat-uat-global`; el extractor de Geneva quedó diseñado *portable* (mismo contenedor en Cloud Run o en VM Windows on-prem) y su deploy lleva `_VPC_CONNECTOR=""` esperando a infra. Para AFP: (1) pedir a infra el **Serverless VPC Access connector + túnel a la red Patria** con ruta al SQL Server:1433 (misma solicitud que ya tiene abierta Geneva para `sanws020`, se suman), y (2) construir `afp-sync` **portable desde el día 1**: si el conector no llega, la misma imagen corre on-prem (Task Scheduler/Docker) escribiendo a BigQuery por HTTPS, con ADC de una identidad que defina infra | (b) Cloud NAT con IP estática y allowlist en el firewall de Patria exponiendo el SQL Server (menos seguro, requiere `Encrypt=yes` con cert válido). (c) **Contingencia híbrida** si la VPN no se aprueba: un extractor on-prem (tarea programada Windows) que deje parquet en GCS y un job que cargue a BigQuery — funciona, pero **no es 100 % GCP** y sólo se usaría de forma transitoria. **Es el ítem que hay que pedir primero** (lead time de redes). |
+| **D1** | Conectividad Cloud Run Job → SQL Server | **RESUELTA por el usuario (2026-09-28): sin VPN.** El túnel que necesitaba Geneva era hacia su servidor Geneva, no aplica aquí. Solución: el job sale por **Cloud NAT con IP estática** (`afp-nat-ip`, VPC `afp-vpc`, Direct VPC egress) y esa IP se allowlistea en el firewall del SQL Server. Además la imagen `afp-sync` es **portable**: si el allowlist se demora, la misma imagen corre en cualquier máquina que alcance el SQL Server, con ADC, escribiendo a BigQuery por HTTPS | **Nota de alcance**: el pipeline sigue leyendo el SQL Server `Inteligencia_Mercado` (única fuente del código actual). Las tablas que consume son elaboraciones del equipo (clasificación `supracategory`, `01_sd/02_sd`, consolidado, retornos Bloomberg, `DIM_BD_*`, `TBL_IPA_V2`); el origen último (spensiones.cl) es público, pero re-apuntar el job a spensiones.cl directo obligaría a rehacer esa clasificación en GCP y rompería el alcance íntegro. Queda fuera de este plan. |
 | **D2** | Autenticación | **Identity Platform, proveedor Email/Password**, importando los usuarios de Supabase con su hash bcrypt (`firebase auth:import --hash-algo=BCRYPT`): misma pantalla de login, mismas credenciales, sesión en cookie `__session` firmada (Firebase Admin `createSessionCookie`) verificada en `proxy.ts` | **IAP** (Identity-Aware Proxy) delante de Cloud Run con cuentas Google: cero código de auth, pero cambia la UX (desaparece el login propio) y exige cuentas Google/Workspace para todos → rompe "alcance íntegro". Se descarta salvo que el equipo lo prefiera explícitamente. **Precedente `geneva` (§4.1):** IAP se intentó el 2026-07-22 y falló por falta de `setIamPolicy`; la consola quedó `--allow-unauthenticated` + login propio con clave compartida (provisorio). Identity Platform necesita que infra habilite `identitytoolkit.googleapis.com` y cree la API key: **pedirlo en el mismo ticket que la conectividad**. Si no llega a tiempo, el fallback compatible con el alcance es el patrón ya usado por el equipo: servicio público + login propio (usuario/contraseña con hash bcrypt en una tabla `afp_ops.users`, sesión firmada) — misma UX, sin dependencia de IAM. |
 | **D3** | Región R | **RESUELTA: `southamerica-west1`** — es la región de todo Geneva (Cloud Run, Artifact Registry, BigQuery, Scheduler) en el mismo proyecto | — |
 | **D4** | Matviews `mv_*` | **Tablas** en `afp_mart` reconstruidas por el paso `marts` del job (`CREATE OR REPLACE TABLE … AS SELECT`), en el mismo punto donde hoy se llama `refresh_alternatives_matviews()` | Materialized views nativas de BigQuery: refresco automático pero SQL restringido (sin `QUALIFY`/window en algunos casos) y costo de refresco incremental. Se descarta para paridad exacta. |
@@ -187,7 +187,7 @@ Operadores PostgREST usados: `select/eq/gte/lte/gt/in/not/order/limit/range/mayb
 | **D6** | Disparo del pipeline | **Cloud Scheduler los días 8 y 18 de cada mes 07:00 America/Santiago** (los pasos son idempotentes; la doble corrida recoge fuentes que llegan tarde, p. ej. CHIST) **+** `workflow_dispatch` en GitHub Actions para corridas manuales con `--only`, `--start`, `--months-back` | Sólo manual (como hoy). Se recomienda automatizar porque ya no hay laptop de por medio. |
 | **D7** | Infra como código | **Cambio de recomendación tras `geneva`: scripts `gcloud`/`bq` idempotentes + diagnóstico `testIamPermissions`** (`infra/setup-afp.sh` y `infra/diagnostico-iam.sh`, calco de `infra/cloudbuild/setup-infra.yaml` y `diagnostico-iam.yaml` de Geneva). Infra de Patria **no delega** `iam.serviceAccountAdmin` ni `resourcemanager.projectIamAdmin`: crea SAs y bindings project-level ella misma, una vez; el resto lo aplica una identidad de despliegue. Terraform exigiría exactamente esos roles para su `apply` y quedaría bloqueado | Terraform sólo si infra acepta operar el `apply` (poco probable según el precedente) |
 
-Además, valores que hay que rellenar: `GCP_PROJECT_ID` (el proyecto actual), dominio final del dashboard (¿se mantiene el de Vercel con CNAME a Cloud Run o uno nuevo?), lista de usuarios a migrar.
+Valores ya fijados por el usuario (2026-09-28): **proyecto `pat-uat-global` (UAT)**, **URLs por defecto de Cloud Run (`*.run.app`), sin dominio propio ni DNS**. Pendiente: lista de usuarios a migrar (base: los 5 correos de la consola Geneva).
 
 ### 4.1 Respuestas obtenidas del repo `IgnacioF1988/geneva` (revisado 2026-09-28)
 
@@ -616,13 +616,14 @@ Resultado `[OK]`/`[WARN]` (diferencia explicada por redondeo de tipo) /`[FAIL]`.
 
 ## 15. Preguntas abiertas para el equipo
 
-1. ~~`GCP_PROJECT_ID`~~ → `pat-uat-global` según `geneva`; **confirmar** que el dashboard AFP puede vivir en el proyecto UAT o si infra provee uno prod. ~~VPC/VPN~~ → **no existe**; entra al ticket a infra (§4.1).
-2. ~~Región~~ → `southamerica-west1` (resuelta).
-3. Confirmar D2: Identity Platform (requiere que infra habilite la API) vs fallback "servicio público + login propio" ya usado por el equipo. IAP descartado por precedente de permisos.
-4. Dominio final de la web y quién administra el DNS (sin precedente en `geneva`: usan `*.run.app`).
-5. ~~Quién opera~~ → Ignacio Fuentes como operador; lista inicial de usuarios = los 5 correos de la consola Geneva, **a confirmar**.
-6. Presupuesto aceptable mensual (sin dato en `geneva`).
-7. **Nueva:** mecanismo de auth para GitHub Actions: WIF (recomendado) o gates en Actions + deploy por Cloud Build triggers (patrón vigente). Ambos requieren acción única de infra.
+Resueltas el 2026-09-28: proyecto `pat-uat-global` (UAT), región `southamerica-west1`, URLs `*.run.app` sin dominio propio, sin VPN (Cloud NAT + IP fija allowlisteada en el SQL Server; imagen portable como respaldo).
+
+Siguen abiertas:
+1. Confirmar D2: Identity Platform (requiere que infra habilite la API y cree la API key) vs fallback "servicio público + login propio" ya usado por el equipo.
+2. Lista definitiva de usuarios del dashboard (base: los 5 correos de la consola Geneva).
+3. Mecanismo de auth para GitHub Actions: WIF (recomendado) o gates en Actions + deploy por Cloud Build triggers. Ambos requieren una acción única de infra (ticket en `infra/README.md`).
+4. Presupuesto mensual aceptable (sin dato; estimación en `docs/GCP_RUNBOOK.md`).
+5. Quién carga el primer valor de los secretos `afp-sqlserver-*` y quién pide el allowlist de la IP NAT al dueño del SQL Server.
 
 ---
 
@@ -630,3 +631,4 @@ Resultado `[OK]`/`[WARN]` (diferencia explicada por redondeo de tipo) /`[FAIL]`.
 
 - 2026-09-28 — Levantamiento completo del repo y redacción de este plan (rama `claude/migracion-gcp-9w4y80`). Pendiente: aprobación y cierre de D1–D7 para arrancar F0.
 - 2026-09-28 — Revisión del repo `IgnacioF1988/geneva` (app hermana en GCP): resueltas región y proyecto, conectividad on-prem confirmada inexistente, D1/D2/D7 reformuladas, F1 pasa a scripts idempotentes, ticket único a infra definido (§4.1).
+- 2026-09-28 — Decisiones del usuario: UAT (`pat-uat-global`), URLs por defecto de Cloud Run, sin VPN. D1 resuelta con Cloud NAT + IP fija e imagen portable. Arranca la ejecución: `sync/` → BigQuery, `web/` → BigQuery + Identity Platform + Docker, `db/bigquery/` + `validation/`, `infra/` + `.github/workflows/` + runbook.
