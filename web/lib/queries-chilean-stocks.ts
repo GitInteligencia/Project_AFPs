@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, RAW, query, toDateStr, toNum } from './db';
 
 export type ChileanStockIssuerRow = {
   emisor: string;
@@ -33,28 +34,33 @@ export type ChileanStocksTopFlows = {
 type NemoSnapshot = { nemo: string; emisor: string; inv_clp: number; price_clp: number };
 
 async function getNemoSnapshot(fecha: string): Promise<NemoSnapshot[]> {
-  const { data, error } = await supabase
-    .from('mv_chist_chilean_stocks_by_nemo')
-    .select('nemo,emisor,inv_clp,price_clp')
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
+  const data = await query<{
+    nemo: string;
+    emisor: string;
+    inv_clp: unknown;
+    price_clp: unknown;
+  }>(
+    `SELECT nemo, emisor, inv_clp, price_clp
+     FROM ${MART}.mv_chist_chilean_stocks_by_nemo
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map((r) => ({
     nemo: r.nemo as string,
     emisor: r.emisor as string,
-    inv_clp: Number(r.inv_clp) || 0,
-    price_clp: Number(r.price_clp) || 0,
+    inv_clp: toNum(r.inv_clp) || 0,
+    price_clp: toNum(r.price_clp) || 0,
   }));
 }
 
 async function getFxClpPerUsd(fecha: string): Promise<number> {
-  const { data, error } = await supabase
-    .from('tipo_cambio')
-    .select('valor')
-    .eq('fecha', fecha)
-    .eq('instrumento_codigo', 'USDCLP Curncy')
-    .limit(1);
-  if (error) throw error;
-  return Number(data?.[0]?.valor) || 0;
+  const data = await query<{ valor: unknown }>(
+    `SELECT valor FROM ${RAW}.tipo_cambio
+     WHERE fecha = DATE(@fecha) AND instrumento_codigo = @instrumento_codigo
+     LIMIT 1`,
+    { fecha, instrumento_codigo: 'USDCLP Curncy' },
+  );
+  return toNum(data[0]?.valor) || 0;
 }
 
 function computeFlowsUnits(
@@ -148,14 +154,13 @@ export async function getChileanStocksDates(): Promise<string[]> {
   // classification needs nemo-level data only CHIST has. Picking gics dates
   // here keeps the default landing fecha aligned with both cards on this
   // page; users wanting SP XML transactions can still navigate via URL.
-  const { data, error } = await supabase
-    .from('v_chilean_stocks_gics')
-    .select('fecha_reporte')
-    .gte('fecha_reporte', '2025-01-01')
-    .order('fecha_reporte', { ascending: false })
-    .limit(5000);
-  if (error) throw error;
-  return Array.from(new Set((data ?? []).map((r) => r.fecha_reporte as string)));
+  const data = await query<{ fecha_reporte: unknown }>(
+    `SELECT fecha_reporte FROM ${MART}.v_chilean_stocks_gics
+     WHERE fecha_reporte >= DATE '2025-01-01'
+     ORDER BY fecha_reporte DESC
+     LIMIT 5000`,
+  );
+  return Array.from(new Set(data.map((r) => toDateStr(r.fecha_reporte))));
 }
 
 // =====================================================================
@@ -185,32 +190,21 @@ export type GicsBreakdown = {
 export async function getChileanStocksGicsBreakdown(
   fecha: string,
 ): Promise<GicsBreakdown> {
-  // Supabase REST caps at 1,000 rows per request. View has ~1,750 rows per fecha
-  // (7 AFPs × 5 multifondos × ~50 emisores), so paginate.
+  // ~1,750 rows per fecha (7 AFPs × 5 multifondos × ~50 emisores); BigQuery
+  // returns them in a single call.
   type Row = {
     gics_sector: string | null;
     gics_sector_name: string | null;
     emisor: string | null;
     nemo: string | null;
-    monto_usd_mm: number | null;
+    monto_usd_mm: unknown;
   };
-  const rows: Row[] = [];
-  let offset = 0;
-  const PAGE = 1000;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_chilean_stocks_gics')
-      .select('gics_sector, gics_sector_name, emisor, nemo, monto_usd_mm')
-      .eq('fecha_reporte', fecha)
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    rows.push(...(data as Row[]));
-    if (data.length < PAGE) break;
-    offset += PAGE;
-  }
-  const data = rows;
+  const data = await query<Row>(
+    `SELECT gics_sector, gics_sector_name, emisor, nemo, monto_usd_mm
+     FROM ${MART}.v_chilean_stocks_gics
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
 
   // Aggregate by sector first
   type AccSector = {
@@ -224,7 +218,7 @@ export async function getChileanStocksGicsBreakdown(
     const sector = (r.gics_sector as string) ?? '—';
     const sectorName = (r.gics_sector_name as string) ?? '—';
     const emisor = (r.emisor as string) ?? '—';
-    const amount = Number(r.monto_usd_mm) || 0;
+    const amount = toNum(r.monto_usd_mm) || 0;
     if (!bySector.has(sector)) {
       bySector.set(sector, { sectorName, issuers: new Map(), total: 0 });
     }

@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNumOrNull } from './db';
 
 export type AssetClassEvoPoint = {
   fecha_reporte: string;
@@ -19,36 +20,24 @@ export type AssetClassEvoPoint = {
 export async function getAssetClassEvolution(
   pdfBucket: 'Fixed Income' | 'Equity',
 ): Promise<AssetClassEvoPoint[]> {
-  // PostgREST defaults to 1000 rows so paginate explicitly. ~15 months × 8
-  // rows per fecha = 120 rows, but past horizon may grow so leave headroom.
-  const rows: Array<{
-    fecha_reporte: string;
+  const data = await query<{
+    fecha_reporte: unknown;
     pdf_em_dm: string | null;
     pdf_subregion: string | null;
-    monto_usd_mm: number | null;
-  }> = [];
-  let offset = 0;
-  const PAGE = 1000;
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_foreign_pdf_summary_combined')
-      .select('fecha_reporte,pdf_em_dm,pdf_subregion,monto_usd_mm')
-      .eq('pdf_bucket', pdfBucket)
-      .order('fecha_reporte', { ascending: true })
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    for (const r of data) {
-      rows.push({
-        fecha_reporte: r.fecha_reporte as string,
-        pdf_em_dm: (r.pdf_em_dm as string | null) ?? null,
-        pdf_subregion: (r.pdf_subregion as string | null) ?? null,
-        monto_usd_mm: r.monto_usd_mm == null ? null : Number(r.monto_usd_mm),
-      });
-    }
-    if (data.length < PAGE) break;
-    offset += PAGE;
-  }
+    monto_usd_mm: unknown;
+  }>(
+    `SELECT fecha_reporte, pdf_em_dm, pdf_subregion, monto_usd_mm
+     FROM ${MART}.v_foreign_pdf_summary_combined
+     WHERE pdf_bucket = @pdf_bucket
+     ORDER BY fecha_reporte ASC`,
+    { pdf_bucket: pdfBucket },
+  );
+  const rows = data.map((r) => ({
+    fecha_reporte: toDateStr(r.fecha_reporte),
+    pdf_em_dm: (r.pdf_em_dm as string | null) ?? null,
+    pdf_subregion: (r.pdf_subregion as string | null) ?? null,
+    monto_usd_mm: r.monto_usd_mm == null ? null : toNumOrNull(r.monto_usd_mm),
+  }));
 
   const byFecha = new Map<string, AssetClassEvoPoint>();
   for (const r of rows) {

@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNum } from './db';
 
 export type DiRow = {
   fecha_valor: string;            // YYYY-MM-DD
@@ -30,25 +31,35 @@ export async function getForeignDirectInvestmentDetail(fecha: string): Promise<{
     return { fechas: target.map((t) => ({ label: t.label, fecha_valor: null })), rows: [] };
   }
 
-  const { data, error } = await supabase
-    .from('mv_sp_direct_investment_detail')
-    .select('periodo,fecha_valor,asset_class,di_category,country,currency,usd_mm')
-    .in('periodo', targetPeriodos);
-  if (error) throw error;
+  const data = await query<{
+    periodo: string | null;
+    fecha_valor: unknown;
+    asset_class: string;
+    di_category: string | null;
+    country: string | null;
+    currency: string | null;
+    usd_mm: unknown;
+  }>(
+    `SELECT periodo, fecha_valor, asset_class, di_category, country, currency, usd_mm
+     FROM ${MART}.mv_sp_direct_investment_detail
+     WHERE periodo IN UNNEST(@periodos)`,
+    { periodos: targetPeriodos },
+    { types: { periodos: ['STRING'] } },
+  );
 
-  const rows: DiRow[] = (data ?? []).map((r) => ({
-    fecha_valor: r.fecha_valor as string,
+  const rows: DiRow[] = data.map((r) => ({
+    fecha_valor: toDateStr(r.fecha_valor),
     asset_class: r.asset_class as string,
     di_category: (r.di_category as string | null) ?? null,
     country: (r.country as string | null) ?? null,
     currency: (r.currency as string | null) ?? null,
-    usd_mm: Number(r.usd_mm) || 0,
+    usd_mm: toNum(r.usd_mm) || 0,
   }));
 
   const periodoToFechaValor = new Map<string, string>();
-  for (const r of data ?? []) {
+  for (const r of data) {
     if (r.periodo && r.fecha_valor) {
-      periodoToFechaValor.set(r.periodo as string, r.fecha_valor as string);
+      periodoToFechaValor.set(r.periodo as string, toDateStr(r.fecha_valor));
     }
   }
 

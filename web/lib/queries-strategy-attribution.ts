@@ -1,9 +1,10 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { DIM, RAW, query, queryOne, toDateStr, toDateStrOrNull, toNum, toNumOrNull } from './db';
 
 // Ajustes_Dashboard 4.1/4.2 — cartera, contribuidores del retorno y rentabilidad
 // por fondo Moneda de cada familia. Fuente: sync/sync_ipd_strategy.py
 // (Inteligencia_Producto TBL_IPA_V2 + TBL_RENTABILIDADES_SERIES, agregado
-// mensual precalculado — el diario nunca toca Supabase).
+// mensual precalculado — el diario nunca toca la base analítica).
 
 export type IpdFundRef = {
   id_fund: number;
@@ -75,16 +76,21 @@ export type FundReturns = {
 export async function getStrategyIpdFunds(
   family_id: number,
 ): Promise<IpdFundRef[]> {
-  const { data, error } = await supabase
-    .from('dim_strategy_ipd_funds')
-    .select('id_fund,fund_label,rent_id_fund')
-    .eq('family_id', family_id)
-    .order('id_fund');
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    id_fund: r.id_fund as number,
+  const data = await query<{
+    id_fund: unknown;
+    fund_label: string;
+    rent_id_fund: unknown;
+  }>(
+    `SELECT id_fund, fund_label, rent_id_fund
+     FROM ${DIM}.dim_strategy_ipd_funds
+     WHERE family_id = @family_id
+     ORDER BY id_fund ASC`,
+    { family_id },
+  );
+  return data.map((r) => ({
+    id_fund: toNum(r.id_fund),
     fund_label: r.fund_label as string,
-    rent_id_fund: (r.rent_id_fund as number | null) ?? null,
+    rent_id_fund: toNumOrNull(r.rent_id_fund),
   }));
 }
 
@@ -102,44 +108,46 @@ async function fetchAttributionRows(
   meses: string[], // YYYY-MM-01 date strings
 ): Promise<Map<string, AttributionRow & { n: number }>> {
   const acc = new Map<string, AttributionRow & { n: number }>();
-  const PAGE = 1000;
-  let offset = 0;
-  for (;;) {
-    const { data, error } = await supabase
-      .from('ipd_attribution_monthly')
-      .select(
-        'id_instrumento,instrumento,company,currency,avg_weight,contrib_total,contrib_price,contrib_fx_carry',
-      )
-      .eq('id_fund', id_fund)
-      .in('mes', meses)
-      .order('row_id')
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    for (const r of data ?? []) {
-      const key = String(r.id_instrumento);
-      const prev = acc.get(key);
-      const row = {
-        id_instrumento: r.id_instrumento as number,
-        instrumento: (r.instrumento as string | null) ?? null,
-        company: (r.company as string | null) ?? null,
-        currency: (r.currency as string | null) ?? null,
-        avg_weight: Number(r.avg_weight) || 0,
-        contrib_total: Number(r.contrib_total) || 0,
-        contrib_price: Number(r.contrib_price) || 0,
-        contrib_fx_carry: Number(r.contrib_fx_carry) || 0,
-      };
-      if (!prev) {
-        acc.set(key, { ...row, n: 1 });
-      } else {
-        prev.avg_weight += row.avg_weight;
-        prev.contrib_total += row.contrib_total;
-        prev.contrib_price += row.contrib_price;
-        prev.contrib_fx_carry += row.contrib_fx_carry;
-        prev.n += 1;
-      }
+  const data = await query<{
+    id_instrumento: unknown;
+    instrumento: string | null;
+    company: string | null;
+    currency: string | null;
+    avg_weight: unknown;
+    contrib_total: unknown;
+    contrib_price: unknown;
+    contrib_fx_carry: unknown;
+  }>(
+    `SELECT id_instrumento, instrumento, company, currency, avg_weight,
+            contrib_total, contrib_price, contrib_fx_carry
+     FROM ${RAW}.ipd_attribution_monthly
+     WHERE id_fund = @id_fund AND mes IN UNNEST(@meses)
+     ORDER BY row_id ASC`,
+    { id_fund, meses },
+    { types: { meses: ['DATE'] } },
+  );
+  for (const r of data) {
+    const key = String(r.id_instrumento);
+    const prev = acc.get(key);
+    const row = {
+      id_instrumento: toNum(r.id_instrumento),
+      instrumento: (r.instrumento as string | null) ?? null,
+      company: (r.company as string | null) ?? null,
+      currency: (r.currency as string | null) ?? null,
+      avg_weight: toNum(r.avg_weight) || 0,
+      contrib_total: toNum(r.contrib_total) || 0,
+      contrib_price: toNum(r.contrib_price) || 0,
+      contrib_fx_carry: toNum(r.contrib_fx_carry) || 0,
+    };
+    if (!prev) {
+      acc.set(key, { ...row, n: 1 });
+    } else {
+      prev.avg_weight += row.avg_weight;
+      prev.contrib_total += row.contrib_total;
+      prev.contrib_price += row.contrib_price;
+      prev.contrib_fx_carry += row.contrib_fx_carry;
+      prev.n += 1;
     }
-    if (!data || data.length < PAGE) break;
-    offset += PAGE;
   }
   for (const v of acc.values()) v.avg_weight /= v.n;
   return acc;
@@ -149,18 +157,24 @@ export async function getFundAttribution(
   id_fund: number,
 ): Promise<FundAttribution | null> {
   // últimos 3 meses disponibles del fondo
-  const { data: mdata, error: e1 } = await supabase
-    .from('ipd_attribution_fund_month')
-    .select('mes,ret_month,ret_serie,residual')
-    .eq('id_fund', id_fund)
-    .order('mes', { ascending: false })
-    .limit(3);
-  if (e1) throw e1;
-  if (!mdata || mdata.length === 0) return null;
+  const mdata = await query<{
+    mes: unknown;
+    ret_month: unknown;
+    ret_serie: unknown;
+    residual: unknown;
+  }>(
+    `SELECT mes, ret_month, ret_serie, residual
+     FROM ${RAW}.ipd_attribution_fund_month
+     WHERE id_fund = @id_fund
+     ORDER BY mes DESC
+     LIMIT 3`,
+    { id_fund },
+  );
+  if (mdata.length === 0) return null;
   const monthsDesc = mdata.map((r) => ({
-    mes: (r.mes as string).slice(0, 10),
-    ret_month: Number(r.ret_month) || 0,
-    ret_serie: r.ret_serie == null ? null : Number(r.ret_serie),
+    mes: toDateStr(r.mes).slice(0, 10),
+    ret_month: toNum(r.ret_month) || 0,
+    ret_serie: r.ret_serie == null ? null : toNumOrNull(r.ret_serie),
   }));
 
   const buildPeriod = async (
@@ -197,43 +211,40 @@ export async function getFundAttribution(
 export async function getFundCartera(
   id_fund: number,
 ): Promise<FundCartera | null> {
-  const { data: latest, error: e1 } = await supabase
-    .from('ipd_cartera_eom')
-    .select('fecha')
-    .eq('id_fund', id_fund)
-    .order('fecha', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (e1) throw e1;
-  const fecha = latest?.fecha as string | undefined;
+  const latest = await queryOne<{ fecha: unknown }>(
+    `SELECT fecha FROM ${RAW}.ipd_cartera_eom
+     WHERE id_fund = @id_fund
+     ORDER BY fecha DESC
+     LIMIT 1`,
+    { id_fund },
+  );
+  const fecha = toDateStrOrNull(latest?.fecha) ?? undefined;
   if (!fecha) return null;
 
-  const rows: CarteraRow[] = [];
-  const PAGE = 1000;
-  let offset = 0;
-  for (;;) {
-    const { data, error } = await supabase
-      .from('ipd_cartera_eom')
-      .select('id_instrumento,instrumento,company,currency,source,mval_usd,weight')
-      .eq('id_fund', id_fund)
-      .eq('fecha', fecha)
-      .order('row_id')
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    for (const r of data ?? []) {
-      rows.push({
-        id_instrumento: r.id_instrumento as number,
-        instrumento: (r.instrumento as string | null) ?? null,
-        company: (r.company as string | null) ?? null,
-        currency: (r.currency as string | null) ?? null,
-        source: (r.source as string | null) ?? null,
-        mval_usd: Number(r.mval_usd) || 0,
-        weight: Number(r.weight) || 0,
-      });
-    }
-    if (!data || data.length < PAGE) break;
-    offset += PAGE;
-  }
+  const data = await query<{
+    id_instrumento: unknown;
+    instrumento: string | null;
+    company: string | null;
+    currency: string | null;
+    source: string | null;
+    mval_usd: unknown;
+    weight: unknown;
+  }>(
+    `SELECT id_instrumento, instrumento, company, currency, source, mval_usd, weight
+     FROM ${RAW}.ipd_cartera_eom
+     WHERE id_fund = @id_fund AND fecha = DATE(@fecha)
+     ORDER BY row_id ASC`,
+    { id_fund, fecha },
+  );
+  const rows: CarteraRow[] = data.map((r) => ({
+    id_instrumento: toNum(r.id_instrumento),
+    instrumento: (r.instrumento as string | null) ?? null,
+    company: (r.company as string | null) ?? null,
+    currency: (r.currency as string | null) ?? null,
+    source: (r.source as string | null) ?? null,
+    mval_usd: toNum(r.mval_usd) || 0,
+    weight: toNum(r.weight) || 0,
+  }));
   const nav_usd = rows.reduce((s, r) => s + r.mval_usd, 0);
   rows.sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
   return { id_fund, fecha, nav_usd, rows };
@@ -242,16 +253,24 @@ export async function getFundCartera(
 export async function getFundReturns(
   rent_id_fund: number,
 ): Promise<FundReturns | null> {
-  const { data, error } = await supabase
-    .from('ipd_rentabilidades')
-    .select(
-      'currency,quiebre,bm_ticker,fecha,mtd,ytd,y1,patrimonio',
-    )
-    .eq('id_fund', rent_id_fund)
-    .order('fecha', { ascending: true })
-    .limit(2000);
-  if (error) throw error;
-  if (!data || data.length === 0) return null;
+  const data = await query<{
+    currency: string;
+    quiebre: string;
+    bm_ticker: string | null;
+    fecha: unknown;
+    mtd: unknown;
+    ytd: unknown;
+    y1: unknown;
+    patrimonio: unknown;
+  }>(
+    `SELECT currency, quiebre, bm_ticker, fecha, mtd, ytd, y1, patrimonio
+     FROM ${RAW}.ipd_rentabilidades
+     WHERE id_fund = @id_fund
+     ORDER BY fecha ASC
+     LIMIT 2000`,
+    { id_fund: rent_id_fund },
+  );
+  if (data.length === 0) return null;
 
   // preferir USD; MDLAT (13) solo publica serie CLP
   const currencies = new Set(data.map((r) => r.currency as string));
@@ -269,7 +288,7 @@ export async function getFundReturns(
   const byFecha = new Map<string, FundReturnPoint>();
   let bm_ticker: string | null = null;
   for (const r of rows) {
-    const fecha = (r.fecha as string).slice(0, 10);
+    const fecha = toDateStr(r.fecha).slice(0, 10);
     if (!isEom(fecha)) continue;
     let p = byFecha.get(fecha);
     if (!p) {
@@ -280,7 +299,7 @@ export async function getFundReturns(
       };
       byFecha.set(fecha, p);
     }
-    const num = (v: unknown) => (v == null ? null : Number(v));
+    const num = (v: unknown) => (v == null ? null : toNumOrNull(v));
     if (r.quiebre === 'Serie') {
       // varias series comparten cuota/retorno; la última gana (valores idénticos)
       p.mtd = num(r.mtd);

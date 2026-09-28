@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNum } from './db';
 import type {
   ForeignSource,
   ForeignSplit,
@@ -13,18 +14,18 @@ import type {
 export async function getForeignDates(): Promise<
   { fecha: string; source: ForeignSource }[]
 > {
-  const { data, error } = await supabase
-    .from('v_foreign_pdf_summary_combined')
-    .select('fecha_reporte,source')
-    .gte('fecha_reporte', '2025-01-01')
-    .order('fecha_reporte', { ascending: false })
-    // ~45-53 rows per fecha; 80 months ≈ 4,000 rows. 5,000 leaves headroom.
-    .limit(5000);
-  if (error) throw error;
+  const data = await query<{ fecha_reporte: unknown; source: string | null }>(
+    `SELECT fecha_reporte, source
+     FROM ${MART}.v_foreign_pdf_summary_combined
+     WHERE fecha_reporte >= DATE '2025-01-01'
+     ORDER BY fecha_reporte DESC
+     -- ~45-53 rows per fecha; 80 months ≈ 4,000 rows. 5,000 leaves headroom.
+     LIMIT 5000`,
+  );
   const seen = new Set<string>();
   const out: { fecha: string; source: ForeignSource }[] = [];
-  for (const r of data ?? []) {
-    const fecha = r.fecha_reporte as string;
+  for (const r of data) {
+    const fecha = toDateStr(r.fecha_reporte);
     if (seen.has(fecha)) continue;
     seen.add(fecha);
     out.push({ fecha, source: (r.source as ForeignSource) ?? 'CHIST' });
@@ -40,22 +41,35 @@ export async function getForeignSummary(
   taxonomy: ForeignTaxonomy = 'nt',
 ): Promise<ForeignSummaryRow[]> {
   const nt = taxonomy === 'nt';
-  const { data, error } = await supabase
-    .from('v_foreign_pdf_summary_combined')
-    .select(
-      'fecha_reporte,pdf_bucket,pdf_em_dm,pdf_subregion,pdf_fi_category,pdf_bucket_nt,pdf_em_dm_nt,pdf_subregion_nt,pdf_fi_category_nt,monto_usd_mm,source',
-    )
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    fecha_reporte: r.fecha_reporte as string,
+  const data = await query<{
+    fecha_reporte: unknown;
+    pdf_bucket: string;
+    pdf_em_dm: string | null;
+    pdf_subregion: string | null;
+    pdf_fi_category: string | null;
+    pdf_bucket_nt: string | null;
+    pdf_em_dm_nt: string | null;
+    pdf_subregion_nt: string | null;
+    pdf_fi_category_nt: string | null;
+    monto_usd_mm: unknown;
+    source: string | null;
+  }>(
+    `SELECT fecha_reporte, pdf_bucket, pdf_em_dm, pdf_subregion, pdf_fi_category,
+            pdf_bucket_nt, pdf_em_dm_nt, pdf_subregion_nt, pdf_fi_category_nt,
+            monto_usd_mm, source
+     FROM ${MART}.v_foreign_pdf_summary_combined
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map((r) => ({
+    fecha_reporte: toDateStr(r.fecha_reporte),
     pdf_bucket: (nt ? r.pdf_bucket_nt : r.pdf_bucket) as string,
     pdf_em_dm: ((nt ? r.pdf_em_dm_nt : r.pdf_em_dm) as string | null) ?? null,
     pdf_subregion:
       ((nt ? r.pdf_subregion_nt : r.pdf_subregion) as string | null) ?? null,
     pdf_fi_category:
       ((nt ? r.pdf_fi_category_nt : r.pdf_fi_category) as string | null) ?? null,
-    monto_usd_mm: Number(r.monto_usd_mm) || 0,
+    monto_usd_mm: toNum(r.monto_usd_mm) || 0,
     source: (r.source as ForeignSource) ?? 'CHIST',
   }));
 }
@@ -237,7 +251,7 @@ function buildSplit(
 
 /**
  * Return/Flow splits for the four Changes windows ending at `fecha`. One
- * paginated fetch covering the widest window (3Y), sliced per window. Windows
+ * fetch covering the widest window (3Y), sliced per window. Windows
  * whose months predate the returns series come back with empty `covered` —
  * the UI shows the un-split total there.
  */
@@ -246,38 +260,39 @@ export async function getForeignChangesSplits(
   taxonomy: ForeignTaxonomy = 'nt',
 ): Promise<ForeignChangesSplits> {
   const { mom, threeM, sixM, ytd, ltm, threeY } = priorBaselines(fecha);
-  const raw: SplitRaw[] = [];
-  const PAGE = 1000;
-  let offset = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_foreign_returns_flows_summary')
-      .select(
-        'fecha_reporte,pdf_bucket,pdf_em_dm,pdf_subregion,pdf_fi_category,pdf_bucket_nt,pdf_em_dm_nt,pdf_subregion_nt,pdf_fi_category_nt,return_usd_mm,flow_usd_mm',
-      )
-      .gt('fecha_reporte', threeY)
-      .lte('fecha_reporte', fecha)
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    for (const r of data ?? []) {
-      raw.push({
-        fecha_reporte: r.fecha_reporte as string,
-        pdf_bucket: r.pdf_bucket as string,
-        pdf_em_dm: (r.pdf_em_dm as string | null) ?? null,
-        pdf_subregion: (r.pdf_subregion as string | null) ?? null,
-        pdf_fi_category: (r.pdf_fi_category as string | null) ?? null,
-        pdf_bucket_nt: (r.pdf_bucket_nt as string | null) ?? null,
-        pdf_em_dm_nt: (r.pdf_em_dm_nt as string | null) ?? null,
-        pdf_subregion_nt: (r.pdf_subregion_nt as string | null) ?? null,
-        pdf_fi_category_nt: (r.pdf_fi_category_nt as string | null) ?? null,
-        return_usd_mm: Number(r.return_usd_mm) || 0,
-        flow_usd_mm: Number(r.flow_usd_mm) || 0,
-      });
-    }
-    if ((data ?? []).length < PAGE) break;
-    offset += PAGE;
-  }
+  const data = await query<{
+    fecha_reporte: unknown;
+    pdf_bucket: string;
+    pdf_em_dm: string | null;
+    pdf_subregion: string | null;
+    pdf_fi_category: string | null;
+    pdf_bucket_nt: string | null;
+    pdf_em_dm_nt: string | null;
+    pdf_subregion_nt: string | null;
+    pdf_fi_category_nt: string | null;
+    return_usd_mm: unknown;
+    flow_usd_mm: unknown;
+  }>(
+    `SELECT fecha_reporte, pdf_bucket, pdf_em_dm, pdf_subregion, pdf_fi_category,
+            pdf_bucket_nt, pdf_em_dm_nt, pdf_subregion_nt, pdf_fi_category_nt,
+            return_usd_mm, flow_usd_mm
+     FROM ${MART}.v_foreign_returns_flows_summary
+     WHERE fecha_reporte > DATE(@start_excl) AND fecha_reporte <= DATE(@end_incl)`,
+    { start_excl: threeY, end_incl: fecha },
+  );
+  const raw: SplitRaw[] = data.map((r) => ({
+    fecha_reporte: toDateStr(r.fecha_reporte),
+    pdf_bucket: r.pdf_bucket as string,
+    pdf_em_dm: (r.pdf_em_dm as string | null) ?? null,
+    pdf_subregion: (r.pdf_subregion as string | null) ?? null,
+    pdf_fi_category: (r.pdf_fi_category as string | null) ?? null,
+    pdf_bucket_nt: (r.pdf_bucket_nt as string | null) ?? null,
+    pdf_em_dm_nt: (r.pdf_em_dm_nt as string | null) ?? null,
+    pdf_subregion_nt: (r.pdf_subregion_nt as string | null) ?? null,
+    pdf_fi_category_nt: (r.pdf_fi_category_nt as string | null) ?? null,
+    return_usd_mm: toNum(r.return_usd_mm) || 0,
+    flow_usd_mm: toNum(r.flow_usd_mm) || 0,
+  }));
   return {
     mom: buildSplit(raw, mom, fecha, taxonomy),
     threeM: buildSplit(raw, threeM, fecha, taxonomy),
@@ -341,7 +356,7 @@ export async function getForeignTopFlows(
   ytd: { inflows: FundDeltaRow[]; outflows: FundDeltaRow[] };
 }> {
   const { mom, ytd } = priorBaselines(fecha);
-  // One paginated fetch over the YTD window (it contains the MoM month).
+  // One fetch over the YTD window (it contains the MoM month).
   type Row = {
     fecha_reporte: string;
     fund_id: string;
@@ -349,30 +364,25 @@ export async function getForeignTopFlows(
     manager: string | null;
     flow_usd_mm: number;
   };
-  const rows: Row[] = [];
-  const PAGE = 1000;
-  let offset = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_foreign_fund_flows')
-      .select('fecha_reporte,fund_id,fondo,manager,flow_usd_mm')
-      .gt('fecha_reporte', ytd)
-      .lte('fecha_reporte', fecha)
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    for (const r of data ?? []) {
-      rows.push({
-        fecha_reporte: r.fecha_reporte as string,
-        fund_id: String(r.fund_id),
-        fondo: r.fondo as string,
-        manager: (r.manager as string | null) ?? null,
-        flow_usd_mm: Number(r.flow_usd_mm) || 0,
-      });
-    }
-    if ((data ?? []).length < PAGE) break;
-    offset += PAGE;
-  }
+  const data = await query<{
+    fecha_reporte: unknown;
+    fund_id: unknown;
+    fondo: string;
+    manager: string | null;
+    flow_usd_mm: unknown;
+  }>(
+    `SELECT fecha_reporte, fund_id, fondo, manager, flow_usd_mm
+     FROM ${MART}.v_foreign_fund_flows
+     WHERE fecha_reporte > DATE(@start_excl) AND fecha_reporte <= DATE(@end_incl)`,
+    { start_excl: ytd, end_incl: fecha },
+  );
+  const rows: Row[] = data.map((r) => ({
+    fecha_reporte: toDateStr(r.fecha_reporte),
+    fund_id: String(r.fund_id),
+    fondo: r.fondo as string,
+    manager: (r.manager as string | null) ?? null,
+    flow_usd_mm: toNum(r.flow_usd_mm) || 0,
+  }));
 
   const momDeltas: FundDeltaRow[] = rows
     .filter((r) => r.fecha_reporte === fecha)
@@ -433,14 +443,27 @@ const MANAGER_ALIASES: Record<string, string> = {
 };
 
 export async function getForeignManagers(fecha: string): Promise<ManagerRow[]> {
-  const { data, error } = await supabase
-    .from('v_foreign_managers_combined')
-    .select(
-      'manager,fund_style,asset_class,category,region,nt_asset_class,nt_sub_asset_class,nt_category,nt_sub_category,nt_region,monto_usd_mm',
-    )
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => {
+  const data = await query<{
+    manager: string | null;
+    fund_style: string | null;
+    asset_class: string | null;
+    category: string | null;
+    region: string | null;
+    nt_asset_class: string | null;
+    nt_sub_asset_class: string | null;
+    nt_category: string | null;
+    nt_sub_category: string | null;
+    nt_region: string | null;
+    monto_usd_mm: unknown;
+  }>(
+    `SELECT manager, fund_style, asset_class, category, region,
+            nt_asset_class, nt_sub_asset_class, nt_category, nt_sub_category, nt_region,
+            monto_usd_mm
+     FROM ${MART}.v_foreign_managers_combined
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map((r) => {
     const rawManager = (r.manager as string) ?? 'Unknown';
     return {
       manager: MANAGER_ALIASES[rawManager] ?? rawManager,
@@ -453,7 +476,7 @@ export async function getForeignManagers(fecha: string): Promise<ManagerRow[]> {
       nt_category: (r.nt_category as string | null) ?? null,
       nt_sub_category: (r.nt_sub_category as string | null) ?? null,
       nt_region: (r.nt_region as string | null) ?? null,
-      monto_usd_mm: Number(r.monto_usd_mm) || 0,
+      monto_usd_mm: toNum(r.monto_usd_mm) || 0,
     };
   });
 }
@@ -477,17 +500,21 @@ export type ForeignEvolutionPoint = {
  * CHIST + SP XML view, so it spans CHIST historical + SP XML recent fechas.
  */
 export async function getForeignEvolution(): Promise<ForeignEvolutionPoint[]> {
-  const { data, error } = await supabase
-    .from('v_foreign_pdf_summary_combined')
-    .select('fecha_reporte,pdf_bucket,monto_usd_mm')
-    .order('fecha_reporte', { ascending: true })
-    .limit(20000);
-  if (error) throw error;
+  const data = await query<{
+    fecha_reporte: unknown;
+    pdf_bucket: string;
+    monto_usd_mm: unknown;
+  }>(
+    `SELECT fecha_reporte, pdf_bucket, monto_usd_mm
+     FROM ${MART}.v_foreign_pdf_summary_combined
+     ORDER BY fecha_reporte ASC
+     LIMIT 20000`,
+  );
   const byFecha = new Map<string, ForeignEvolutionPoint>();
-  for (const r of data ?? []) {
-    const fecha = r.fecha_reporte as string;
+  for (const r of data) {
+    const fecha = toDateStr(r.fecha_reporte);
     const bucket = r.pdf_bucket as string;
-    const usd = Number(r.monto_usd_mm) || 0;
+    const usd = toNum(r.monto_usd_mm) || 0;
     let p = byFecha.get(fecha);
     if (!p) {
       p = {

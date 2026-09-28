@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, RAW, query, queryOne, toDateStr, toNum } from './db';
 import {
   AFPS,
   C1_CATEGORIES,
@@ -13,26 +14,35 @@ import {
 export async function getAvailableDates(limit = 60): Promise<string[]> {
   // v_total = cartera (CHIST) dates, the binding constraint — v_aum reaches
   // further back/forward but NAV/Uncalled only exist where carteras do.
-  const { data, error } = await supabase
-    .from('v_total')
-    .select('fecha')
-    .gte('fecha', '2025-01-01')
-    .order('fecha', { ascending: false })
-    .limit(limit * AFPS.length);
-  if (error) throw error;
-  return Array.from(new Set((data ?? []).map((r) => r.fecha as string)));
+  const data = await query<{ fecha: unknown }>(
+    `SELECT fecha FROM ${MART}.v_total
+     WHERE fecha >= DATE '2025-01-01'
+     ORDER BY fecha DESC
+     LIMIT @lim`,
+    { lim: limit * AFPS.length },
+  );
+  return Array.from(new Set(data.map((r) => toDateStr(r.fecha))));
 }
 
 export async function getOverview(fecha: string): Promise<OverviewRow[]> {
-  const [aumRes, navRes, uncRes, totRes] = await Promise.all([
-    supabase.from('v_aum').select('afp,aum_usd_mm').eq('fecha', fecha),
-    supabase.from('v_nav').select('afp,nav_usd_mm').eq('fecha', fecha),
-    supabase.from('v_uncalled').select('afp,uncalled_usd_mm').eq('fecha', fecha),
-    supabase.from('v_total').select('afp,total_usd_mm').eq('fecha', fecha),
+  const [aumRows, navRows, uncRows, totRows] = await Promise.all([
+    query<{ afp: string; aum_usd_mm: unknown }>(
+      `SELECT afp, aum_usd_mm FROM ${MART}.v_aum WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
+    query<{ afp: string; nav_usd_mm: unknown }>(
+      `SELECT afp, nav_usd_mm FROM ${MART}.v_nav WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
+    query<{ afp: string; uncalled_usd_mm: unknown }>(
+      `SELECT afp, uncalled_usd_mm FROM ${MART}.v_uncalled WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
+    query<{ afp: string; total_usd_mm: unknown }>(
+      `SELECT afp, total_usd_mm FROM ${MART}.v_total WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
   ]);
-  for (const r of [aumRes, navRes, uncRes, totRes]) {
-    if (r.error) throw r.error;
-  }
   const map = new Map<string, OverviewRow>();
   const ensure = (afp: string) => {
     let row = map.get(afp);
@@ -42,10 +52,10 @@ export async function getOverview(fecha: string): Promise<OverviewRow[]> {
     }
     return row;
   };
-  for (const r of aumRes.data ?? []) ensure(r.afp).aum = Number(r.aum_usd_mm) || 0;
-  for (const r of navRes.data ?? []) ensure(r.afp).nav = Number(r.nav_usd_mm) || 0;
-  for (const r of uncRes.data ?? []) ensure(r.afp).uncalled = Number(r.uncalled_usd_mm) || 0;
-  for (const r of totRes.data ?? []) ensure(r.afp).total = Number(r.total_usd_mm) || 0;
+  for (const r of aumRows) ensure(r.afp).aum = toNum(r.aum_usd_mm) || 0;
+  for (const r of navRows) ensure(r.afp).nav = toNum(r.nav_usd_mm) || 0;
+  for (const r of uncRows) ensure(r.afp).uncalled = toNum(r.uncalled_usd_mm) || 0;
+  for (const r of totRows) ensure(r.afp).total = toNum(r.total_usd_mm) || 0;
 
   return [...map.values()]
     .filter((r) => r.aum + r.nav + r.uncalled + r.total > 0)
@@ -60,47 +70,54 @@ export async function getOverview(fecha: string): Promise<OverviewRow[]> {
 export async function getOverviewDetail(
   fecha: string,
 ): Promise<Record<string, MultifondoRow[]>> {
-  const [mfRes, fxRes, patRes] = await Promise.all([
-    supabase
-      .from('v_afp_multifondo')
-      .select('afp,tipo_de_fondo,nav_usd_mm,uncalled_usd_mm,total_usd_mm')
-      .eq('fecha', fecha),
-    supabase
-      .from('tipo_cambio')
-      .select('valor')
-      .eq('fecha', fecha)
-      .eq('instrumento_codigo', 'CLFXDOOB_sindesf')
-      .maybeSingle(),
-    supabase
-      .from('valores_cuota_patrimonio')
-      .select('afp,multifondo,valor_patrimonio')
-      .eq('fecha', fecha),
+  const [mfRows, fxRow, patRows] = await Promise.all([
+    query<{
+      afp: string;
+      tipo_de_fondo: string;
+      nav_usd_mm: unknown;
+      uncalled_usd_mm: unknown;
+      total_usd_mm: unknown;
+    }>(
+      `SELECT afp, tipo_de_fondo, nav_usd_mm, uncalled_usd_mm, total_usd_mm
+       FROM ${MART}.v_afp_multifondo
+       WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
+    queryOne<{ valor: unknown }>(
+      `SELECT valor FROM ${RAW}.tipo_cambio
+       WHERE fecha = DATE(@fecha) AND instrumento_codigo = @instrumento_codigo
+       LIMIT 1`,
+      { fecha, instrumento_codigo: 'CLFXDOOB_sindesf' },
+    ),
+    query<{ afp: string; multifondo: string; valor_patrimonio: unknown }>(
+      `SELECT afp, multifondo, valor_patrimonio
+       FROM ${RAW}.valores_cuota_patrimonio
+       WHERE fecha = DATE(@fecha)`,
+      { fecha },
+    ),
   ]);
-  for (const r of [mfRes, fxRes, patRes]) {
-    if (r.error) throw r.error;
-  }
 
-  const fx = Number(fxRes.data?.valor) || 0;
+  const fx = toNum(fxRow?.valor) || 0;
 
   // AUM (USD MM) per afp+multifondo from the cuota/patrimonio table.
   const aumByKey = new Map<string, number>();
   if (fx > 0) {
-    for (const r of patRes.data ?? []) {
+    for (const r of patRows) {
       const key = `${r.afp}|${r.multifondo}`;
-      const aum = (Number(r.valor_patrimonio) || 0) / fx / 1_000_000;
+      const aum = (toNum(r.valor_patrimonio) || 0) / fx / 1_000_000;
       aumByKey.set(key, (aumByKey.get(key) ?? 0) + aum);
     }
   }
 
   const byAfp: Record<string, MultifondoRow[]> = {};
-  for (const r of mfRes.data ?? []) {
+  for (const r of mfRows) {
     const afp = r.afp as string;
     const mf = r.tipo_de_fondo as string;
     (byAfp[afp] ??= []).push({
       multifondo: mf,
-      nav: Number(r.nav_usd_mm) || 0,
-      uncalled: Number(r.uncalled_usd_mm) || 0,
-      total: Number(r.total_usd_mm) || 0,
+      nav: toNum(r.nav_usd_mm) || 0,
+      uncalled: toNum(r.uncalled_usd_mm) || 0,
+      total: toNum(r.total_usd_mm) || 0,
       aum: aumByKey.get(`${afp}|${mf}`) ?? 0,
     });
   }
@@ -111,15 +128,14 @@ export async function getOverviewDetail(
 }
 
 export async function getNavByAfpC1(fecha: string): Promise<AfpC1Row[]> {
-  const { data, error } = await supabase
-    .from('v_afp_c1')
-    .select('afp,c1,total_usd_mm')
-    .eq('fecha', fecha);
-  if (error) throw error;
+  const data = await query<{ afp: string; c1: string; total_usd_mm: unknown }>(
+    `SELECT afp, c1, total_usd_mm FROM ${MART}.v_afp_c1 WHERE fecha = DATE(@fecha)`,
+    { fecha },
+  );
 
   const afpSet = new Set<string>(AFPS);
   const byAfp = new Map<string, AfpC1Row>();
-  for (const r of data ?? []) {
+  for (const r of data) {
     const afp = r.afp as string;
     if (!afpSet.has(afp)) continue;
     if (!byAfp.has(afp)) {
@@ -128,7 +144,7 @@ export async function getNavByAfpC1(fecha: string): Promise<AfpC1Row[]> {
       byAfp.set(afp, empty);
     }
     if ((C1_CATEGORIES as readonly string[]).includes(r.c1 as string)) {
-      byAfp.get(afp)![r.c1 as C1Name] = Number(r.total_usd_mm) || 0;
+      byAfp.get(afp)![r.c1 as C1Name] = toNum(r.total_usd_mm) || 0;
     }
   }
   return [...byAfp.values()]
@@ -140,18 +156,14 @@ export async function getEvolution(): Promise<{
   totals: EvolutionPoint[];
   aums: EvolutionPoint[];
 }> {
-  const [totalRes, aumRes] = await Promise.all([
-    supabase
-      .from('v_total')
-      .select('fecha,afp,total_usd_mm')
-      .order('fecha', { ascending: true }),
-    supabase
-      .from('v_aum')
-      .select('fecha,afp,aum_usd_mm')
-      .order('fecha', { ascending: true }),
+  const [totalRows, aumRows] = await Promise.all([
+    query<{ fecha: unknown; afp: string; total_usd_mm: unknown }>(
+      `SELECT fecha, afp, total_usd_mm FROM ${MART}.v_total ORDER BY fecha ASC`,
+    ),
+    query<{ fecha: unknown; afp: string; aum_usd_mm: unknown }>(
+      `SELECT fecha, afp, aum_usd_mm FROM ${MART}.v_aum ORDER BY fecha ASC`,
+    ),
   ]);
-  if (totalRes.error) throw totalRes.error;
-  if (aumRes.error) throw aumRes.error;
 
   const afpSet = new Set<string>(AFPS);
 
@@ -169,17 +181,17 @@ export async function getEvolution(): Promise<{
 
   return {
     totals: pivot(
-      (totalRes.data ?? []).map((r) => ({
-        fecha: r.fecha as string,
+      totalRows.map((r) => ({
+        fecha: toDateStr(r.fecha),
         afp: r.afp as string,
-        value: Number(r.total_usd_mm) || 0,
+        value: toNum(r.total_usd_mm) || 0,
       })),
     ),
     aums: pivot(
-      (aumRes.data ?? []).map((r) => ({
-        fecha: r.fecha as string,
+      aumRows.map((r) => ({
+        fecha: toDateStr(r.fecha),
         afp: r.afp as string,
-        value: Number(r.aum_usd_mm) || 0,
+        value: toNum(r.aum_usd_mm) || 0,
       })),
     ),
   };
