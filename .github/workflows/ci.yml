@@ -1,0 +1,108 @@
+# CI — gates en cada PR y push. No despliega nada ni toca GCP.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    name: web (lint, tsc, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # Lint BLOQUEANTE sobre la capa que toca la migración (lib/, login, api, proxy, config).
+      - name: lint (capa migrada, bloqueante)
+        run: npx eslint lib app/login app/api proxy.ts next.config.ts --max-warnings 50
+      # Lint completo INFORMATIVO: app/**/page.tsx y components/** traen 22 errores
+      # preexistentes (react-hooks/*, no-explicit-any) que la migración no toca por
+      # alcance. Se muestran en el log pero no enrojecen el gate; se limpian aparte.
+      - name: lint (repo completo, informativo)
+        run: npm run lint
+        continue-on-error: true
+      - run: npx tsc --noEmit
+      # Valores dummy: `next build` sólo necesita que existan; no se conecta a BigQuery.
+      - run: npm run build
+        env:
+          GCP_PROJECT_ID: ci-dummy
+          BQ_LOCATION: southamerica-west1
+          BQ_DATASET_RAW: afp_raw
+          BQ_DATASET_DIM: afp_dim
+          BQ_DATASET_MART: afp_mart
+          NEXT_PUBLIC_IDP_API_KEY: ci-dummy
+          REVALIDATE_TOKEN: ci-dummy
+          NEXT_TELEMETRY_DISABLED: '1'
+
+  python:
+    name: python (ruff, compileall, main.py --list)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: sync/requirements.txt
+      # pyodbc compila contra unixODBC; sin las cabeceras el pip install falla.
+      - name: unixODBC headers (para pyodbc)
+        run: sudo apt-get update -q && sudo apt-get install -y -q unixodbc-dev
+      - run: pip install -r sync/requirements.txt ruff pytest
+      # Sólo errores reales (sintaxis, nombres indefinidos): los scripts legacy no
+      # pasan el estilo completo y este gate no debe enrojecer por eso.
+      - run: ruff check --output-format github --select E9,F63,F7,F82 main.py sync/
+      - run: python -m compileall -q main.py sync/
+      - run: python main.py --list
+      - name: pytest (si existe sync/tests)
+        run: |
+          if [ -d sync/tests ]; then python -m pytest -q sync/tests; else echo "sin sync/tests — se omite"; fi
+
+  sql:
+    name: sql (apply.py --parse-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          if [ -f db/bigquery/requirements.txt ]; then pip install -r db/bigquery/requirements.txt; else pip install google-cloud-bigquery; fi
+      # --parse-check no toca GCP: sólo valida que cada .sql de db/bigquery/ parsea en orden.
+      - run: python db/bigquery/apply.py --parse-check
+
+  docker:
+    name: docker (build sin push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build afp/sync (contexto raíz)
+        run: docker build -f sync/Dockerfile -t afp/sync:ci .
+      - name: build afp/web (contexto web/)
+        run: docker build -f web/Dockerfile -t afp/web:ci web
+      - name: smoke afp/sync (--list no necesita red ni credenciales)
+        run: docker run --rm afp/sync:ci --list
+
+  infra:
+    name: infra (bash -n)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: for f in infra/*.sh; do bash -n "$f" && echo "ok $f"; done
+      - run: shellcheck -S error infra/*.sh

@@ -1,0 +1,25 @@
+# Orden de reconstruccion de los marts (tablas mv_*) en BigQuery. Un nombre por linea; `#` comenta.
+# Lo consume el paso `marts` del job afp-sync (sustituye a refresh_alternatives_matviews() y a los
+# REFRESH MATERIALIZED VIEW sueltos de las migrations). Cada nombre = db/bigquery/marts/<nombre>.sql.
+#
+# 1) Reproduce refresh_alternatives_matviews() (sync/mv_alternatives_materialize.sql + sync/mv_strategy_afp_ow_uw.sql):
+mv_chist_aa
+mv_aum
+mv_strategy_afp_ow_uw
+# 2) Resto de matviews con DDL en el repo (Foreign). Orden topologico:
+#    mv_chist_foreign_managers          <- v_chist_foreign_classified (chist_adjusted)      [sync/v_foreign_chist_switch.sql REFRESH]
+#    mv_consolidated_foreign_pdf_summary<- v_consolidated_foreign_pdf (consolidated_sd)    [sync/v_foreign_consolidated_switch.sql]
+#    mv_sp_direct_investment_detail     <- v_sp_direct_investment_detail (consolidated_sd) [sync/v_foreign_di_switch.sql REFRESH]
+mv_chist_foreign_managers
+mv_consolidated_foreign_pdf_summary
+mv_sp_direct_investment_detail
+# 3) Pendientes de dump (sin DDL en el repo; ver _PENDIENTES_DUMP.md). Descomentar cuando exista el .sql:
+# mv_foreign_pdf_summary               <- v_chist_foreign_pdf (CHIST)            [REFRESH en sync/v_foreign_chist_switch.sql]
+# mv_sp_direct_investment_summary      <- v_sp_direct_investment_detail          [REFRESH en sync/v_foreign_di_switch.sql]
+# mv_returns_afp_tipo                  <- v_cuota_month_end + v_daily_flows      [LINEAGE.md]
+# mv_foreign_fund_flows                <- v_foreign_returns_flows                [REFRESH en sync/v_foreign_flows_switch.sql]
+# mv_foreign_returns_flows_summary     <- v_foreign_returns_flows                [REFRESH en sync/v_foreign_flows_switch.sql]
+# mv_foreign_latam_monthly             <- v_foreign_latam_monthly                [LINEAGE.md]
+# mv_chist_chilean_stocks_by_nemo      <- chist_adjusted                         [PLAN_SQL_SINGLE_SOURCE.md]
+# mv_chist_foreign_by_fund             <- v_chist_foreign_classified (probablemente huerfana; solo aparece en un REFRESH)
+# mv_chist_foreign_units_by_nemo       <- v_chist_foreign_classified (probablemente huerfana; solo aparece en un REFRESH)

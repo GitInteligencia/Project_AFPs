@@ -1,0 +1,131 @@
+# Deploy de la web (Cloud Run service afp-web).
+#  - push a main con cambios en web/**        -> build, push, deploy con tráfico
+#  - pull_request con cambios en web/**       -> revisión sin tráfico con tag pr-<n> y URL comentada en el PR
+#  - workflow_dispatch                        -> redeploy manual del HEAD actual
+# Auth: Workload Identity Federation (sin llaves). Config en infra/README.md §5.
+name: deploy-web
+
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/deploy-web.yml']
+  pull_request:
+    paths: ['web/**']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write   # comentar la URL de preview
+
+concurrency:
+  group: deploy-web-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVICE: afp-web
+  AR_REPO: afp
+
+jobs:
+  preflight:
+    # Hasta que infra cree el pool WIF y se carguen GCP_WIF_PROVIDER / GCP_DEPLOY_SA en
+    # GitHub (infra/README.md §ticket), el deploy se OMITE (skipped, no failed).
+    name: secrets WIF presentes?
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.chk.outputs.ready }}
+    steps:
+      - id: chk
+        env:
+          WIF: ${{ secrets.GCP_WIF_PROVIDER }}
+          SA: ${{ secrets.GCP_DEPLOY_SA }}
+        run: |
+          if [ -n "$WIF" ] && [ -n "$SA" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP_WIF_PROVIDER / GCP_DEPLOY_SA no configurados: deploy omitido (ver infra/README.md)."
+          fi
+
+  deploy:
+    name: build & deploy afp-web
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: uat
+    # Un PR desde un fork no tiene secrets: sólo PRs del mismo repo hacen preview.
+    if: needs.preflight.outputs.ready == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: docker login Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: build & push
+        id: image
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/web:${{ github.sha }}"
+          docker build -f web/Dockerfile -t "$IMAGE" web
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # NEXT_PUBLIC_IDP_API_KEY se inyecta en runtime desde Secret Manager: la web la usa
+      # server-side (login() llama a identitytoolkit desde el servidor). Si algún día
+      # hiciera falta en el bundle del navegador habría que pasarla como build-arg.
+      - name: deploy (con tráfico)
+        if: github.event_name != 'pull_request'
+        run: |
+          gcloud run deploy "$SERVICE" \
+            --image "${{ steps.image.outputs.image }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "afp-web-run@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --min-instances 1 --max-instances 3 --memory 1Gi --cpu 1 --port 8080 \
+            --set-env-vars "GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},BQ_LOCATION=${{ vars.GCP_REGION }},BQ_DATASET_RAW=afp_raw,BQ_DATASET_DIM=afp_dim,BQ_DATASET_MART=afp_mart" \
+            --set-secrets "REVALIDATE_TOKEN=afp-web-revalidate-token:latest,NEXT_PUBLIC_IDP_API_KEY=afp-idp-api-key:latest" \
+            --update-labels "app=afp-dashboard,env=uat,managed-by=afp-setup" \
+            --quiet
+          echo "URL: $(gcloud run services describe "$SERVICE" --region "${{ vars.GCP_REGION }}" --format='value(status.url)')" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: deploy preview (sin tráfico, tag pr-N)
+        if: github.event_name == 'pull_request'
+        id: preview
+        run: |
+          TAG="pr-${{ github.event.pull_request.number }}"
+          gcloud run deploy "$SERVICE" \
+            --image "${{ steps.image.outputs.image }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "afp-web-run@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --allow-unauthenticated \
+            --min-instances 1 --max-instances 3 --memory 1Gi --cpu 1 --port 8080 \
+            --set-env-vars "GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},BQ_LOCATION=${{ vars.GCP_REGION }},BQ_DATASET_RAW=afp_raw,BQ_DATASET_DIM=afp_dim,BQ_DATASET_MART=afp_mart" \
+            --set-secrets "REVALIDATE_TOKEN=afp-web-revalidate-token:latest,NEXT_PUBLIC_IDP_API_KEY=afp-idp-api-key:latest" \
+            --no-traffic --tag "$TAG" \
+            --quiet
+          URL=$(gcloud run services describe "$SERVICE" --region "${{ vars.GCP_REGION }}" --format=json \
+                | python3 -c "import json,sys; t=json.load(sys.stdin)['status'].get('traffic',[]); print(next((x['url'] for x in t if x.get('tag')=='$TAG'),''))")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview $TAG: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: comentar URL en el PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        with:
+          script: |
+            const url = process.env.PREVIEW_URL;
+            const marker = '<!-- afp-web-preview -->';
+            const body = `${marker}\n**Preview afp-web** (Cloud Run, sin tráfico, tag \`pr-${context.issue.number}\`): ${url}\n\nCommit \`${context.sha.slice(0, 7)}\`. La revisión se sobreescribe en cada push; se limpia sola con la política de revisiones del servicio.`;
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number });
+            const prev = comments.find(c => c.body && c.body.startsWith(marker));
+            if (prev) await github.rest.issues.updateComment({ ...context.repo, comment_id: prev.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });

@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, RAW, query, queryOne, toDateStrOrNull, toNum } from './db';
 import type {
   Sec05SizeRow,
   Sec05IpsaMembershipRow,
@@ -9,6 +10,9 @@ import type {
 // Sec05 sobre SQL vivo (2026-07-01): Pionero/MRV desde ipd_cartera_eom
 // (TBL_IPA_V2 type=2), índices desde ipd_bms_membership (TBL_BMS_Exposicion),
 // AFPs desde v_chilean_stocks_gics (CHIST). Sin seeds JSON.
+//
+// Las 4 RPC de Supabase (f_sec05_*) son table functions en afp_mart con los
+// mismos nombres de parámetro (p_fecha).
 
 // Per-source resolved fechas for a given target. Used to render per-column
 // dates in card headers so the user understands exactly what they're seeing.
@@ -23,102 +27,100 @@ export async function getSec05ResolvedFechas(
   targetFecha: string,
 ): Promise<Sec05ResolvedFechas> {
   const [pionero, mrv, ipsa, afps] = await Promise.all([
-    supabase
-      .from('ipd_cartera_eom')
-      .select('fecha')
-      .eq('id_fund', 33)
-      .lte('fecha', targetFecha)
-      .order('fecha', { ascending: false })
-      .limit(1)
-      .maybeSingle(),
-    supabase
-      .from('ipd_cartera_eom')
-      .select('fecha')
-      .eq('id_fund', 19)
-      .lte('fecha', targetFecha)
-      .order('fecha', { ascending: false })
-      .limit(1)
-      .maybeSingle(),
-    supabase
-      .from('ipd_bms_membership')
-      .select('fecha')
-      .lte('fecha', targetFecha)
-      .order('fecha', { ascending: false })
-      .limit(1)
-      .maybeSingle(),
-    supabase
-      .from('v_chilean_stocks_gics')
-      .select('fecha_reporte')
-      .lte('fecha_reporte', targetFecha)
-      .order('fecha_reporte', { ascending: false })
-      .limit(1)
-      .maybeSingle(),
+    queryOne<{ fecha: unknown }>(
+      `SELECT fecha FROM ${RAW}.ipd_cartera_eom
+       WHERE id_fund = @id_fund AND fecha <= DATE(@fecha)
+       ORDER BY fecha DESC
+       LIMIT 1`,
+      { id_fund: 33, fecha: targetFecha },
+    ),
+    queryOne<{ fecha: unknown }>(
+      `SELECT fecha FROM ${RAW}.ipd_cartera_eom
+       WHERE id_fund = @id_fund AND fecha <= DATE(@fecha)
+       ORDER BY fecha DESC
+       LIMIT 1`,
+      { id_fund: 19, fecha: targetFecha },
+    ),
+    queryOne<{ fecha: unknown }>(
+      `SELECT fecha FROM ${RAW}.ipd_bms_membership
+       WHERE fecha <= DATE(@fecha)
+       ORDER BY fecha DESC
+       LIMIT 1`,
+      { fecha: targetFecha },
+    ),
+    queryOne<{ fecha_reporte: unknown }>(
+      `SELECT fecha_reporte FROM ${MART}.v_chilean_stocks_gics
+       WHERE fecha_reporte <= DATE(@fecha)
+       ORDER BY fecha_reporte DESC
+       LIMIT 1`,
+      { fecha: targetFecha },
+    ),
   ]);
   return {
-    pionero: (pionero.data?.fecha as string | undefined) ?? null,
-    mrv: (mrv.data?.fecha as string | undefined) ?? null,
-    ipsa: (ipsa.data?.fecha as string | undefined) ?? null,
-    afps: (afps.data?.fecha_reporte as string | undefined) ?? null,
+    pionero: toDateStrOrNull(pionero?.fecha),
+    mrv: toDateStrOrNull(mrv?.fecha),
+    ipsa: toDateStrOrNull(ipsa?.fecha),
+    afps: toDateStrOrNull(afps?.fecha_reporte),
   };
 }
 
 export async function getSec05SizeBreakdown(
   fecha: string,
 ): Promise<Sec05SizeRow[]> {
-  const { data, error } = await supabase.rpc('f_sec05_size', {
-    p_fecha: fecha,
-  });
-  if (error) throw error;
-  return (data ?? []).map((r: Record<string, unknown>) => ({
+  const data = await query<Record<string, unknown>>(
+    `SELECT * FROM ${MART}.f_sec05_size(DATE(@p_fecha))`,
+    { p_fecha: fecha },
+  );
+  return data.map((r) => ({
     bucket: r.bucket as Sec05SizeRow['bucket'],
-    pionero_pct: Number(r.pionero_pct) || 0,
-    mrv_pct: Number(r.mrv_pct) || 0,
-    ipsa_pct: Number(r.ipsa_pct) || 0,
-    afps_pct: Number(r.afps_pct) || 0,
+    pionero_pct: toNum(r.pionero_pct) || 0,
+    mrv_pct: toNum(r.mrv_pct) || 0,
+    ipsa_pct: toNum(r.ipsa_pct) || 0,
+    afps_pct: toNum(r.afps_pct) || 0,
   }));
 }
 
 export async function getSec05IpsaMembership(
   fecha: string,
 ): Promise<Sec05IpsaMembershipRow[]> {
-  const { data, error } = await supabase.rpc('f_sec05_ipsa_membership', {
-    p_fecha: fecha,
-  });
-  if (error) throw error;
-  return (data ?? []).map((r: Record<string, unknown>) => ({
+  const data = await query<Record<string, unknown>>(
+    `SELECT * FROM ${MART}.f_sec05_ipsa_membership(DATE(@p_fecha))`,
+    { p_fecha: fecha },
+  );
+  return data.map((r) => ({
     bucket: r.bucket as Sec05IpsaMembershipRow['bucket'],
-    pionero_pct: Number(r.pionero_pct) || 0,
-    mrv_pct: Number(r.mrv_pct) || 0,
-    ipsa_pct: Number(r.ipsa_pct) || 0,
-    afps_pct: Number(r.afps_pct) || 0,
+    pionero_pct: toNum(r.pionero_pct) || 0,
+    mrv_pct: toNum(r.mrv_pct) || 0,
+    ipsa_pct: toNum(r.ipsa_pct) || 0,
+    afps_pct: toNum(r.afps_pct) || 0,
   }));
 }
 
 export async function getSec05Concentration(
   fecha: string,
 ): Promise<Sec05ConcentrationRow[]> {
-  const { data, error } = await supabase.rpc('f_sec05_concentration', {
-    p_fecha: fecha,
-  });
-  if (error) throw error;
-  return (data ?? []).map((r: Record<string, unknown>) => ({
+  const data = await query<Record<string, unknown>>(
+    `SELECT * FROM ${MART}.f_sec05_concentration(DATE(@p_fecha))`,
+    { p_fecha: fecha },
+  );
+  return data.map((r) => ({
     metric: r.metric as Sec05ConcentrationRow['metric'],
-    pionero: Number(r.pionero) || 0,
-    mrv: Number(r.mrv) || 0,
-    ipsa: Number(r.ipsa) || 0,
-    afps: Number(r.afps) || 0,
+    pionero: toNum(r.pionero) || 0,
+    mrv: toNum(r.mrv) || 0,
+    ipsa: toNum(r.ipsa) || 0,
+    afps: toNum(r.afps) || 0,
   }));
 }
 
 export async function getSec05Top40(
   fecha: string,
 ): Promise<Sec05Top40Row[]> {
-  const { data, error } = await supabase.rpc('f_sec05_top40', {
-    p_fecha: fecha,
-  });
-  if (error) throw error;
-  return (data ?? []).map((r: Record<string, unknown>) => ({
-    rk: Number(r.rk) || 0,
+  const data = await query<Record<string, unknown>>(
+    `SELECT * FROM ${MART}.f_sec05_top40(DATE(@p_fecha))`,
+    { p_fecha: fecha },
+  );
+  return data.map((r) => ({
+    rk: toNum(r.rk) || 0,
     nemo: r.nemo as string,
     emisor: (r.emisor as string | null) ?? null,
     company_name: (r.company_name as string | null) ?? null,
@@ -126,7 +128,7 @@ export async function getSec05Top40(
     size_bucket: (r.size_bucket as Sec05Top40Row['size_bucket']) ?? null,
     gics_name: (r.gics_name as string | null) ?? null,
     gics_chist: (r.gics_chist as string | null) ?? null,
-    monto_usd_mm: Number(r.monto_usd_mm) || 0,
-    weight: Number(r.weight) || 0,
+    monto_usd_mm: toNum(r.monto_usd_mm) || 0,
+    weight: toNum(r.weight) || 0,
   }));
 }

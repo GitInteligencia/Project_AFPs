@@ -1,0 +1,84 @@
+# Aplica el esquema BigQuery versionado (db/bigquery/: tables -> seeds -> views -> functions)
+# con db/bigquery/apply.py. Idempotente (CREATE OR REPLACE / MERGE de seeds).
+#  - push a main con cambios en db/**  -> apply sin marts (los mv_* los reconstruye el job)
+#  - workflow_dispatch                 -> apply; con `with_marts` también reconstruye los mv_*
+#                                         (útil tras cambiar un marts/*.sql sin esperar la corrida)
+name: deploy-bq
+
+on:
+  push:
+    branches: [main]
+    paths: ['db/**', '.github/workflows/deploy-bq.yml']
+  workflow_dispatch:
+    inputs:
+      with_marts:
+        description: 'Reconstruir también las tablas mv_* (db/bigquery/marts/)'
+        type: boolean
+        default: false
+      only:
+        description: 'Aplicar sólo esta(s) carpeta(s)/objeto(s) (flag --only de apply.py); vacío = todo'
+        type: string
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-bq
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    # Hasta que infra cree el pool WIF y se carguen GCP_WIF_PROVIDER / GCP_DEPLOY_SA en
+    # GitHub (infra/README.md §ticket), el deploy se OMITE (skipped, no failed).
+    name: secrets WIF presentes?
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.chk.outputs.ready }}
+    steps:
+      - id: chk
+        env:
+          WIF: ${{ secrets.GCP_WIF_PROVIDER }}
+          SA: ${{ secrets.GCP_DEPLOY_SA }}
+        run: |
+          if [ -n "$WIF" ] && [ -n "$SA" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP_WIF_PROVIDER / GCP_DEPLOY_SA no configurados: deploy omitido (ver infra/README.md)."
+          fi
+
+  apply:
+    name: apply.py
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: |
+          if [ -f db/bigquery/requirements.txt ]; then pip install -r db/bigquery/requirements.txt; else pip install google-cloud-bigquery; fi
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - name: parse-check (gate previo, sin tocar GCP)
+        run: python db/bigquery/apply.py --parse-check
+
+      - name: apply
+        run: |
+          ARGS=(--project "${{ vars.GCP_PROJECT_ID }}" --location "${{ vars.GCP_REGION }}")
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [ "${{ inputs.with_marts }}" = "true" ] && ARGS+=(--with-marts)
+            [ -n "${{ inputs.only }}" ] && ARGS+=(--only "${{ inputs.only }}")
+          fi
+          echo "python db/bigquery/apply.py ${ARGS[*]}"
+          python db/bigquery/apply.py "${ARGS[@]}" | tee -a "$GITHUB_STEP_SUMMARY"

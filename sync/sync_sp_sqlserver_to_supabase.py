@@ -1,8 +1,10 @@
 """
-Sync SQL Server (Inteligencia_Mercado.dbo.AFP_CL_SP_*) -> Supabase (sp_*, cotizantes_afp).
+Sync SQL Server (Inteligencia_Mercado.dbo.AFP_CL_SP_*) -> BigQuery (sp_*, cotizantes_afp).
 
-SQL Server es source of truth con historia completa. Supabase es el backend
-que sirve al dashboard y mantiene solo la "ventana viva" de datos.
+DESTINO (2026-09, migracion GCP): BigQuery afp_raw via sync/bq_io.py (ADC), ya no
+Supabase. El nombre del archivo se conserva (main.py lo invoca como paso
+`cotizantes`). SQL Server es source of truth con historia completa; BigQuery es
+el backend que sirve al dashboard y mantiene solo la "ventana viva" de datos.
 
 ⚠️ MIRROR sp_* RETIRADO (2026-06-26)
 ====================================
@@ -63,7 +65,7 @@ MODOS DE EJECUCION
 VARIABLES REQUERIDAS EN .env
 ============================
   DB_SERVER, DB_DATABASE, DB_UID, DB_PWD     (SQL Server)
-  SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY    (Supabase REST API)
+  GCP_PROJECT_ID, BQ_LOCATION (opcionales; defaults en sync/bq_io.py) + ADC
 """
 
 import os
@@ -71,13 +73,14 @@ import sys
 import argparse
 import urllib.parse
 from datetime import datetime
-from decimal import Decimal
 from time import time
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-from supabase import create_client, Client
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bq_io  # noqa: E402
 
 load_dotenv()
 
@@ -100,8 +103,8 @@ WINDOW_START_FECHA   = "2025-01-01"   # cotizantes_afp: filtro fecha >= esto
 # existe ni en SQL Server; se restaurara via TBL_SPE_REPORTE25_SD).
 BASELINE_PERIODOS = ("2022-11", "2024-11")
 
-# Batch a Supabase. supabase-py serializa todo el batch en un POST; batches
-# muy grandes pueden chocar contra el body size limit. 500 es seguro.
+# Tamano de batch heredado de supabase-py; bq_insert lo ignora (un load job
+# parquet por DataFrame). Se conserva para no tocar las firmas.
 SB_BATCH = 500
 
 
@@ -132,13 +135,9 @@ def connect_sqlserver():
     return create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
 
-def connect_supabase() -> Client:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not all([url, key]):
-        raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
-    print(f"  Supabase:   {url}")
-    return create_client(url, key)
+def connect_supabase():
+    """Wrapper de compatibilidad: devuelve un bigquery.Client (ADC)."""
+    return bq_io.connect_bigquery()
 
 
 # =============================================================
@@ -155,37 +154,8 @@ def normalize_periodo(s: str) -> str:
     raise ValueError(f"Periodo invalido: {s!r}")
 
 
-def _json_safe(v):
-    """Convierte tipos no-JSON a sus equivalentes serializables.
-    Trampa principal: float NaN. df.where(pd.notnull, None) NO funciona en
-    columnas float64 porque pandas re-coerciona None -> NaN al guardarlo en
-    el array. Hay que filtrar por valor con pd.isna()."""
-    if v is None:
-        return None
-    try:
-        if pd.isna(v):    # cubre NaN, NaT, pd.NA
-            return None
-    except (TypeError, ValueError):
-        pass    # pd.isna falla con tipos exoticos (arrays, etc) — pasamos
-    if isinstance(v, Decimal):
-        return float(v)
-    if isinstance(v, bool):
-        return v
-    if hasattr(v, "isoformat"):    # datetime.date / datetime / pd.Timestamp
-        return v.isoformat()
-    return v
-
-
-def _rows_to_dicts(df: pd.DataFrame) -> list:
-    """DataFrame -> list[dict] con tipos JSON-safe."""
-    out = []
-    for r in df.to_dict(orient="records"):
-        out.append({k: _json_safe(v) for k, v in r.items()})
-    return out
-
-
-def cleanup_out_of_window(client: Client) -> None:
-    """Borra de Supabase los periodos < WINDOW_START_PERIODO (data heredada del
+def cleanup_out_of_window(client) -> None:
+    """Borra de BigQuery los periodos < WINDOW_START_PERIODO (data heredada del
     pipeline viejo que escribia directo), EXCEPTO los BASELINE_PERIODOS que el
     dashboard necesita. One-shot al inicio del mirror."""
     print(f"[cleanup] borrando cotizantes con fecha < {WINDOW_START_FECHA}"
@@ -193,18 +163,21 @@ def cleanup_out_of_window(client: Client) -> None:
              f"(preservando baselines {', '.join(BASELINE_PERIODOS)})" if SYNC_SP_TABLES else ""))
     n_fila = 0
     if SYNC_SP_TABLES:
-        resp = (
-            client.table("sp_fila")
-            .delete()
-            .lt("periodo", WINDOW_START_PERIODO)
-            .not_.in_("periodo", list(BASELINE_PERIODOS))
-            .execute()
-        )
-        n_fila = len(resp.data) if resp.data else 0
+        # BigQuery no tiene ON DELETE CASCADE: primero las 3 hijas por fila_id, luego sp_fila.
+        from google.cloud import bigquery
+        params = [
+            bigquery.ScalarQueryParameter("w", "STRING", WINDOW_START_PERIODO),
+            bigquery.ArrayQueryParameter("baselines", "STRING", list(BASELINE_PERIODOS)),
+        ]
+        cond = "periodo < @w AND periodo NOT IN UNNEST(@baselines)"
+        fila_fq = bq_io.resolve_table("sp_fila")
+        for child in ("sp_valor_fondo", "sp_valor_afp", "sp_valor_instrumento"):
+            bq_io.run_dml(client, f"DELETE FROM `{bq_io.resolve_table(child)}` WHERE fila_id IN "
+                                  f"(SELECT fila_id FROM `{fila_fq}` WHERE {cond})", params)
+        n_fila = bq_io.run_dml(client, f"DELETE FROM `{fila_fq}` WHERE {cond}", params)
         if n_fila:
-            print(f"      {n_fila:,} sp_fila viejas borradas (cascade hijas)")
-    resp = client.table("cotizantes_afp").delete().lt("fecha", WINDOW_START_FECHA).execute()
-    n_cot = len(resp.data) if resp.data else 0
+            print(f"      {n_fila:,} sp_fila viejas borradas (+ hijas)")
+    n_cot = bq_io.bq_delete_where_lt(client, "cotizantes_afp", "fecha", WINDOW_START_FECHA)
     if n_cot:
         print(f"      {n_cot:,} cotizantes_afp viejos borrados")
     if not (n_fila or n_cot):
@@ -212,21 +185,19 @@ def cleanup_out_of_window(client: Client) -> None:
     print()
 
 
-def _insert_batches(client: Client, table: str, rows: list, batch_size: int = SB_BATCH) -> int:
-    if not rows:
+def _insert_batches(client, table: str, df: pd.DataFrame, batch_size: int = SB_BATCH) -> int:
+    """INSERT (append) del DataFrame via bq_io.bq_insert (un load job parquet;
+    batch_size se ignora). Antes recibia list[dict] JSON para supabase-py."""
+    if df is None or df.empty:
         return 0
-    total = 0
-    for i in range(0, len(rows), batch_size):
-        client.table(table).insert(rows[i:i + batch_size]).execute()
-        total += min(batch_size, len(rows) - i)
-    return total
+    return bq_io.bq_insert(client, table, df, batch_size=batch_size)
 
 
 # =============================================================
 # SYNC sp_fila + 3 hijas
 # =============================================================
 
-# Columnas exactas a copiar (excluyo created_at: Supabase pone el suyo via default)
+# Columnas exactas a copiar (excluyo created_at: el destino pone el suyo via default)
 SP_FILA_COLS = [
     "fila_id", "periodo", "fecha_valor", "fecha_publicacion",
     "cuadro", "sub_listado_codigo", "fila_numero", "glosa",
@@ -264,7 +235,7 @@ def get_target_periodos(engine, override: str = None) -> list:
     return [r[0] for r in rows]
 
 
-def sync_periodo(engine, client: Client, periodo: str) -> dict:
+def sync_periodo(engine, client, periodo: str) -> dict:
     """Mirror un periodo completo. Asume que en SQL Server esta finalizado."""
     print(f"[periodo {periodo}]")
     t0 = time()
@@ -301,7 +272,7 @@ def sync_periodo(engine, client: Client, periodo: str) -> dict:
             conn,
         )
 
-    # SQL Server BIT viene como int 0/1; Supabase espera bool. Casteamos.
+    # SQL Server BIT viene como int 0/1; el destino espera bool. Casteamos.
     if "es_subtotal" in df_fila.columns:
         df_fila["es_subtotal"] = df_fila["es_subtotal"].astype(bool)
 
@@ -310,17 +281,22 @@ def sync_periodo(engine, client: Client, periodo: str) -> dict:
         f"{len(df_vf):,} vf | {len(df_va):,} va | {len(df_vi):,} vi"
     )
 
-    # === 2. DELETE EN SUPABASE (CASCADE limpia las 3 hijas) ===
-    resp = client.table("sp_fila").delete().eq("periodo", periodo).execute()
-    deleted = len(resp.data) if resp.data else 0
+    # === 2. DELETE EN BIGQUERY (sin CASCADE: hijas por fila_id, luego sp_fila) ===
+    fila_fq = bq_io.resolve_table("sp_fila")
+    for child in ("sp_valor_fondo", "sp_valor_afp", "sp_valor_instrumento"):
+        bq_io.run_dml(client, f"DELETE FROM `{bq_io.resolve_table(child)}` WHERE fila_id IN "
+                              f"(SELECT fila_id FROM `{fila_fq}` WHERE periodo = @p)",
+                      [bq_io.scalar_param("p", periodo)])
+    deleted = bq_io.run_dml(client, f"DELETE FROM `{fila_fq}` WHERE periodo = @p",
+                            [bq_io.scalar_param("p", periodo)])
     if deleted:
-        print(f"      Supa: {deleted:,} sp_fila previas borradas")
+        print(f"      BQ:   {deleted:,} sp_fila previas borradas")
 
-    # === 3. INSERT EN SUPABASE ===
-    n_filas = _insert_batches(client, "sp_fila",            _rows_to_dicts(df_fila))
-    n_vf    = _insert_batches(client, "sp_valor_fondo",     _rows_to_dicts(df_vf))
-    n_va    = _insert_batches(client, "sp_valor_afp",       _rows_to_dicts(df_va))
-    n_vi    = _insert_batches(client, "sp_valor_instrumento", _rows_to_dicts(df_vi))
+    # === 3. INSERT EN BIGQUERY ===
+    n_filas = _insert_batches(client, "sp_fila",              df_fila)
+    n_vf    = _insert_batches(client, "sp_valor_fondo",       df_vf)
+    n_va    = _insert_batches(client, "sp_valor_afp",         df_va)
+    n_vi    = _insert_batches(client, "sp_valor_instrumento", df_vi)
 
     print(
         f"      Ins:  {n_filas:,} fila | "
@@ -333,7 +309,7 @@ def sync_periodo(engine, client: Client, periodo: str) -> dict:
 # SYNC cotizantes
 # =============================================================
 
-def sync_cotizantes(engine, client: Client) -> int:
+def sync_cotizantes(engine, client) -> int:
     """Sincroniza la ventana entera de un saque (es chiquita: 7 filas/mes)."""
     print(f"[cotizantes >= {WINDOW_START_FECHA}]")
     t0 = time()
@@ -357,12 +333,11 @@ def sync_cotizantes(engine, client: Client) -> int:
     print(f"      SQL:  {len(df):,} filas")
 
     # DELETE rango entero + INSERT (mas simple que per-fecha)
-    resp = client.table("cotizantes_afp").delete().gte("fecha", WINDOW_START_FECHA).execute()
-    deleted = len(resp.data) if resp.data else 0
+    deleted = bq_io.bq_delete_where_gte(client, "cotizantes_afp", "fecha", WINDOW_START_FECHA)
     if deleted:
-        print(f"      Supa: {deleted:,} cotizantes_afp previas borradas")
+        print(f"      BQ:   {deleted:,} cotizantes_afp previas borradas")
 
-    n = _insert_batches(client, "cotizantes_afp", _rows_to_dicts(df))
+    n = _insert_batches(client, "cotizantes_afp", df)
     print(f"      Ins:  {n:,} filas  ({time()-t0:.1f}s)\n")
     return n
 
@@ -371,19 +346,17 @@ def sync_cotizantes(engine, client: Client) -> int:
 # RESUMEN
 # =============================================================
 
-def print_summary(client: Client):
-    print("--- Resumen Supabase tras sync ---")
+def print_summary(client):
+    print("--- Resumen BigQuery tras sync ---")
     tablas = ("sp_fila", "sp_valor_fondo", "sp_valor_afp", "sp_valor_instrumento", "cotizantes_afp") \
         if SYNC_SP_TABLES else ("cotizantes_afp",)
     for tbl in tablas:
-        resp = client.table(tbl).select("*", count="exact").limit(1).execute()
-        print(f"  {tbl:24s} {resp.count or 0:>10,} filas")
+        print(f"  {tbl:24s} {bq_io.bq_count(client, tbl):>10,} filas")
 
     if SYNC_SP_TABLES:
-        asc = client.table("sp_fila").select("periodo").order("periodo", desc=False).limit(1).execute()
-        dsc = client.table("sp_fila").select("periodo").order("periodo", desc=True).limit(1).execute()
-        if asc.data and dsc.data:
-            print(f"  rango sp_fila:           [{asc.data[0]['periodo']} -> {dsc.data[0]['periodo']}]")
+        _, mn, mx = bq_io.bq_table_stats(client, "sp_fila", "periodo")
+        if mn and mx:
+            print(f"  rango sp_fila:           [{mn} -> {mx}]")
 
 
 # =============================================================
@@ -392,7 +365,7 @@ def print_summary(client: Client):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync SQL Server AFP_CL_SP_* -> Supabase sp_* (ventana >= 2025-01)",
+        description="Sync SQL Server AFP_CL_SP_* -> BigQuery sp_* / cotizantes_afp (ventana >= 2025-01)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

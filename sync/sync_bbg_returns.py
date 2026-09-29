@@ -1,10 +1,11 @@
 """
-Sync de retornos Bloomberg de fondos (no alternativos) SQL Server -> Supabase:
+Sync de retornos Bloomberg de fondos (no alternativos) SQL Server -> BigQuery:
   Inteligencia_Mercado.dbo.AFP_CL_BBG_Returns  ->  bbg_returns
 
 Retorno mensual USD por fondo (Nemo_SP). Reemplaza a bbg_returns_foreign (Excel,
 solo foreign). Historia COMPLETA por defecto. Idempotente: DELETE de los end_date
-presentes en el pull + INSERT. REST API (HTTPS/443).
+presentes en el pull + INSERT. Destino BigQuery (afp_raw) via sync/bq_io.py con ADC
+(antes: Supabase REST).
 
 Requiere que la tabla destino exista (ver bbg_returns_schema.sql).
 
@@ -27,6 +28,7 @@ from sync_sqlserver_to_supabase import (  # noqa: E402
     supabase_delete_in,
     timed_read,
 )
+from bq_io import bq_count  # noqa: E402
 
 load_dotenv()
 
@@ -48,9 +50,9 @@ def build_query(start):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Sync AFP_CL_BBG_Returns -> Supabase bbg_returns")
+    ap = argparse.ArgumentParser(description="Sync AFP_CL_BBG_Returns -> BigQuery bbg_returns")
     ap.add_argument('--start', default=None, help='Inicio YYYY-MM-DD por end_date (default: historia completa)')
-    ap.add_argument('--dry-run', action='store_true', help='Solo lee de SQL y reporta; no escribe en Supabase')
+    ap.add_argument('--dry-run', action='store_true', help='Solo lee de SQL y reporta; no escribe en BigQuery')
     args = ap.parse_args()
 
     eng = connect_sqlserver()
@@ -67,7 +69,7 @@ def main():
           f"[{fechas[0]} .. {fechas[-1]}]")
 
     if args.dry_run:
-        print("      DRY-RUN: no se escribe nada en Supabase.")
+        print("      DRY-RUN: no se escribe nada en BigQuery.")
         return
 
     sb = connect_supabase()
@@ -76,8 +78,8 @@ def main():
     n = supabase_insert(sb, DST_TABLE, df, batch_size=500, show_progress=True)
     print(f"      -> {n:,} filas insertadas")
 
-    got = sb.table(DST_TABLE).select('fila_id', count='exact').limit(1).execute()
-    print(f"      verificacion: {got.count:,} filas en Supabase (esperado >= {len(df):,})")
+    got = bq_count(sb, DST_TABLE)
+    print(f"      verificacion: {got:,} filas en BigQuery (esperado >= {len(df):,})")
     print("\n=== DONE ===")
 
 

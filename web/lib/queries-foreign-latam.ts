@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNum } from './db';
 
 export type LatamMonthPoint = {
   fecha_reporte: string; // YYYY-MM-DD
@@ -17,21 +18,24 @@ export type LatamMonthPoint = {
  * Total Foreign for the % charts. All in USD MM at USDCLP Curncy.
  */
 export async function getLatamEvolution(): Promise<LatamMonthPoint[]> {
-  const [latamRes, totalRes] = await Promise.all([
-    supabase
-      .from('mv_foreign_latam_monthly')
-      .select('fecha_reporte,pdf_bucket,style_group,monto_usd_mm')
-      .order('fecha_reporte', { ascending: true }),
-    supabase
-      .from('v_foreign_pdf_summary_combined')
-      .select('fecha_reporte,monto_usd_mm')
-      .order('fecha_reporte', { ascending: true })
-      // 11 fechas × ~45 rows leaves us plenty under PostgREST's 1000 cap, but
-      // bump explicitly so this won't silently truncate as months accrue.
-      .limit(5000),
+  const [latamRows, totalRows] = await Promise.all([
+    query<{
+      fecha_reporte: unknown;
+      pdf_bucket: string;
+      style_group: string;
+      monto_usd_mm: unknown;
+    }>(
+      `SELECT fecha_reporte, pdf_bucket, style_group, monto_usd_mm
+       FROM ${MART}.mv_foreign_latam_monthly
+       ORDER BY fecha_reporte ASC`,
+    ),
+    query<{ fecha_reporte: unknown; monto_usd_mm: unknown }>(
+      `SELECT fecha_reporte, monto_usd_mm
+       FROM ${MART}.v_foreign_pdf_summary_combined
+       ORDER BY fecha_reporte ASC
+       LIMIT 5000`,
+    ),
   ]);
-  if (latamRes.error) throw latamRes.error;
-  if (totalRes.error) throw totalRes.error;
 
   const byFecha = new Map<string, LatamMonthPoint>();
   function point(fecha: string): LatamMonthPoint {
@@ -52,11 +56,11 @@ export async function getLatamEvolution(): Promise<LatamMonthPoint[]> {
     return p;
   }
 
-  for (const r of latamRes.data ?? []) {
-    const fecha = r.fecha_reporte as string;
+  for (const r of latamRows) {
+    const fecha = toDateStr(r.fecha_reporte);
     const bucket = r.pdf_bucket as string;
     const style = r.style_group as string;
-    const usd = Number(r.monto_usd_mm) || 0;
+    const usd = toNum(r.monto_usd_mm) || 0;
     const p = point(fecha);
     if (bucket === 'Equity') {
       if (style === 'Active') p.eq_active += usd;
@@ -73,10 +77,10 @@ export async function getLatamEvolution(): Promise<LatamMonthPoint[]> {
     }
   }
 
-  for (const r of totalRes.data ?? []) {
-    const fecha = r.fecha_reporte as string;
+  for (const r of totalRows) {
+    const fecha = toDateStr(r.fecha_reporte);
     const p = point(fecha);
-    p.total_foreign += Number(r.monto_usd_mm) || 0;
+    p.total_foreign += toNum(r.monto_usd_mm) || 0;
   }
 
   return Array.from(byFecha.values()).sort((a, b) =>

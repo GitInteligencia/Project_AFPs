@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNum } from './db';
 import {
   ALT_AFPS,
   INFRA_STRATEGIES,
@@ -14,10 +15,6 @@ import {
 } from './types-alternatives';
 import { C1_CATEGORIES } from './dimensions';
 
-// PostgREST caps responses at 1000 rows; v_afp_c2 unfiltered (SYSTEM view)
-// exceeds that, so page through with .range().
-const PAGE = 1000;
-
 type C2Row = {
   fecha: string;
   afp: string;
@@ -26,42 +23,43 @@ type C2Row = {
   total_usd_mm: number | null;
 };
 
+// v_afp_c2 unfiltered (SYSTEM view) is several thousand rows; BigQuery returns
+// the whole result set in one call, so no pagination is needed. Ordering by
+// the view's full GROUP BY key is kept for deterministic output.
 async function fetchAllC2(afp: AfpOrSystem): Promise<C2Row[]> {
-  const rows: C2Row[] = [];
-  for (let from = 0; ; from += PAGE) {
-    // Order by the view's full GROUP BY key — .range() pagination needs a
-    // total order or page boundaries can duplicate/drop rows.
-    let q = supabase
-      .from('v_afp_c2')
-      .select('fecha,afp,region,alt_strategy,total_usd_mm')
-      .order('fecha', { ascending: true })
-      .order('afp', { ascending: true })
-      .order('region', { ascending: true })
-      .order('category', { ascending: true })
-      .order('alt_fund_type', { ascending: true })
-      .order('alt_strategy', { ascending: true })
-      .range(from, from + PAGE - 1);
-    if (afp !== 'SYSTEM') q = q.eq('afp', afp);
-    const { data, error } = await q;
-    if (error) throw error;
-    rows.push(...((data ?? []) as C2Row[]));
-    if (!data || data.length < PAGE) break;
-  }
-  return rows;
+  const where = afp !== 'SYSTEM' ? 'WHERE afp = @afp' : '';
+  const rows = await query<{
+    fecha: unknown;
+    afp: string;
+    region: 'Local' | 'Foreign';
+    alt_strategy: string | null;
+    total_usd_mm: unknown;
+  }>(
+    `SELECT fecha, afp, region, alt_strategy, total_usd_mm
+     FROM ${MART}.v_afp_c2
+     ${where}
+     ORDER BY fecha ASC, afp ASC, region ASC, category ASC, alt_fund_type ASC, alt_strategy ASC`,
+    afp !== 'SYSTEM' ? { afp } : {},
+  );
+  return rows.map((r) => ({
+    fecha: toDateStr(r.fecha),
+    afp: r.afp,
+    region: r.region,
+    alt_strategy: r.alt_strategy ?? null,
+    total_usd_mm: r.total_usd_mm == null ? null : toNum(r.total_usd_mm),
+  }));
 }
 
 // Total Alternatives (NAV + Uncalled) by C1 category, full history.
 export async function getTotalC1Evolution(): Promise<SeriesPoint[]> {
-  const { data, error } = await supabase
-    .from('v_total_c1')
-    .select('fecha,c1,total_usd_mm')
-    .order('fecha', { ascending: true });
-  if (error) throw error;
+  const data = await query<{ fecha: unknown; c1: string; total_usd_mm: unknown }>(
+    `SELECT fecha, c1, total_usd_mm FROM ${MART}.v_total_c1 ORDER BY fecha ASC`,
+  );
   return pivotSeries(
-    (data ?? []).map((r) => ({
-      fecha: r.fecha as string,
+    data.map((r) => ({
+      fecha: toDateStr(r.fecha),
       key: r.c1 as string,
-      value: Number(r.total_usd_mm) || 0,
+      value: toNum(r.total_usd_mm) || 0,
     })),
     C1_CATEGORIES,
   );
@@ -73,28 +71,24 @@ export async function getNavUncalledEvolution(): Promise<{
   uncalledByAfp: SeriesPoint[];
   navVsUncalled: SeriesPoint[];
 }> {
-  const [navRes, uncRes] = await Promise.all([
-    supabase
-      .from('v_nav')
-      .select('fecha,afp,nav_usd_mm')
-      .order('fecha', { ascending: true }),
-    supabase
-      .from('v_uncalled')
-      .select('fecha,afp,uncalled_usd_mm')
-      .order('fecha', { ascending: true }),
+  const [navData, uncData] = await Promise.all([
+    query<{ fecha: unknown; afp: string; nav_usd_mm: unknown }>(
+      `SELECT fecha, afp, nav_usd_mm FROM ${MART}.v_nav ORDER BY fecha ASC`,
+    ),
+    query<{ fecha: unknown; afp: string; uncalled_usd_mm: unknown }>(
+      `SELECT fecha, afp, uncalled_usd_mm FROM ${MART}.v_uncalled ORDER BY fecha ASC`,
+    ),
   ]);
-  if (navRes.error) throw navRes.error;
-  if (uncRes.error) throw uncRes.error;
 
-  const navRows = (navRes.data ?? []).map((r) => ({
-    fecha: r.fecha as string,
+  const navRows = navData.map((r) => ({
+    fecha: toDateStr(r.fecha),
     key: r.afp as string,
-    value: Number(r.nav_usd_mm) || 0,
+    value: toNum(r.nav_usd_mm) || 0,
   }));
-  const uncRows = (uncRes.data ?? []).map((r) => ({
-    fecha: r.fecha as string,
+  const uncRows = uncData.map((r) => ({
+    fecha: toDateStr(r.fecha),
     key: r.afp as string,
-    value: Number(r.uncalled_usd_mm) || 0,
+    value: toNum(r.uncalled_usd_mm) || 0,
   }));
 
   const sumByFecha = (rows: { fecha: string; value: number }[], key: string) =>
@@ -114,20 +108,22 @@ export async function getNavUncalledEvolution(): Promise<{
 // Buckets follow the legacy workbook: strategy + region define the bucket,
 // Alt_Fund_Type is aggregated over, Infrastructure/Real Estate are roll-ups.
 export async function getAfpDetail(afp: AfpOrSystem): Promise<AfpDetailSeries> {
-  let c1q = supabase
-    .from('v_afp_c1')
-    .select('fecha,afp,c1,total_usd_mm')
-    .order('fecha', { ascending: true });
-  if (afp !== 'SYSTEM') c1q = c1q.eq('afp', afp);
+  const c1Where = afp !== 'SYSTEM' ? 'WHERE afp = @afp' : '';
+  const c1q = query<{ fecha: unknown; afp: string; c1: string; total_usd_mm: unknown }>(
+    `SELECT fecha, afp, c1, total_usd_mm
+     FROM ${MART}.v_afp_c1
+     ${c1Where}
+     ORDER BY fecha ASC`,
+    afp !== 'SYSTEM' ? { afp } : {},
+  );
 
-  const [c1Res, c2Rows] = await Promise.all([c1q, fetchAllC2(afp)]);
-  if (c1Res.error) throw c1Res.error;
+  const [c1Rows, c2Rows] = await Promise.all([c1q, fetchAllC2(afp)]);
 
   const byC1 = pivotSeries(
-    (c1Res.data ?? []).map((r) => ({
-      fecha: r.fecha as string,
+    c1Rows.map((r) => ({
+      fecha: toDateStr(r.fecha),
       key: r.c1 as string,
-      value: Number(r.total_usd_mm) || 0,
+      value: toNum(r.total_usd_mm) || 0,
     })),
     C1_CATEGORIES,
   );

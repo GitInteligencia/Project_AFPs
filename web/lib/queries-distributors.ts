@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { DIM, MART, query, toDateStr, toNum } from './db';
 import type {
   DistributorMappingRow,
   DistributorSec09Row,
@@ -6,33 +7,39 @@ import type {
 } from './types-distributors';
 
 export async function getDistributorMapping(): Promise<DistributorMappingRow[]> {
-  const { data, error } = await supabase
-    .from('dim_distributor_by_manager')
-    .select('manager,distributor,is_ambiguous,notes,updated_at,updated_by')
-    .order('manager', { ascending: true });
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
+  const data = await query<{
+    manager: string;
+    distributor: string;
+    is_ambiguous: unknown;
+    notes: string | null;
+    updated_at: unknown;
+    updated_by: string | null;
+  }>(
+    `SELECT manager, distributor, is_ambiguous, notes, updated_at, updated_by
+     FROM ${DIM}.dim_distributor_by_manager
+     ORDER BY manager ASC`,
+  );
+  return data.map((r) => ({
     manager: r.manager as string,
     distributor: r.distributor as string,
     is_ambiguous: Boolean(r.is_ambiguous),
     notes: (r.notes as string | null) ?? null,
-    updated_at: r.updated_at as string,
+    updated_at: toDateStr(r.updated_at),
     updated_by: (r.updated_by as string | null) ?? null,
   }));
 }
 
 export async function getDistributorsSec09Dates(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('v_distributors_sec09')
-    .select('fecha_reporte')
-    .gte('fecha_reporte', '2025-01-01')
-    .order('fecha_reporte', { ascending: false })
-    .limit(10000);
-  if (error) throw error;
+  const data = await query<{ fecha_reporte: unknown }>(
+    `SELECT fecha_reporte FROM ${MART}.v_distributors_sec09
+     WHERE fecha_reporte >= DATE '2025-01-01'
+     ORDER BY fecha_reporte DESC
+     LIMIT 10000`,
+  );
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const r of data ?? []) {
-    const f = r.fecha_reporte as string;
+  for (const r of data) {
+    const f = toDateStr(r.fecha_reporte);
     if (seen.has(f)) continue;
     seen.add(f);
     out.push(f);
@@ -40,21 +47,34 @@ export async function getDistributorsSec09Dates(): Promise<string[]> {
   return out;
 }
 
-export async function getDistributorsSec09(
-  fecha: string,
-): Promise<DistributorSec09Row[]> {
-  const { data, error } = await supabase
-    .from('v_distributors_sec09')
-    .select('fecha_reporte,distributor,manager,is_mapped,monto_usd_mm')
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    fecha_reporte: r.fecha_reporte as string,
+type Sec09Raw = {
+  fecha_reporte: unknown;
+  distributor: string;
+  manager: string;
+  is_mapped: unknown;
+  monto_usd_mm: unknown;
+};
+
+function mapSec09(r: Sec09Raw): DistributorSec09Row {
+  return {
+    fecha_reporte: toDateStr(r.fecha_reporte),
     distributor: r.distributor as string,
     manager: r.manager as string,
     is_mapped: Boolean(r.is_mapped),
-    monto_usd_mm: Number(r.monto_usd_mm) || 0,
-  }));
+    monto_usd_mm: toNum(r.monto_usd_mm) || 0,
+  };
+}
+
+export async function getDistributorsSec09(
+  fecha: string,
+): Promise<DistributorSec09Row[]> {
+  const data = await query<Sec09Raw>(
+    `SELECT fecha_reporte, distributor, manager, is_mapped, monto_usd_mm
+     FROM ${MART}.v_distributors_sec09
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map(mapSec09);
 }
 
 // Resolve the four PDF Sec 09 baseline fechas given a "today" date:
@@ -85,18 +105,15 @@ export async function getDistributorsSec09Batch(
   fechas: string[],
 ): Promise<DistributorSec09Row[]> {
   const unique = Array.from(new Set(fechas));
-  const { data, error } = await supabase
-    .from('v_distributors_sec09')
-    .select('fecha_reporte,distributor,manager,is_mapped,monto_usd_mm')
-    .in('fecha_reporte', unique);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    fecha_reporte: r.fecha_reporte as string,
-    distributor: r.distributor as string,
-    manager: r.manager as string,
-    is_mapped: Boolean(r.is_mapped),
-    monto_usd_mm: Number(r.monto_usd_mm) || 0,
-  }));
+  const data = await query<Sec09Raw>(
+    `SELECT fecha_reporte, distributor, manager, is_mapped, monto_usd_mm
+     FROM ${MART}.v_distributors_sec09
+     WHERE fecha_reporte IN UNNEST(@fechas)`,
+    { fechas: unique },
+    // Explicit element type: an empty array can't be inferred by the client.
+    { types: { fechas: ['DATE'] } },
+  );
+  return data.map(mapSec09);
 }
 
 // Managers with foreign AUM > 0 on the latest fecha that have no entry in

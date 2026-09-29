@@ -9,7 +9,8 @@ Extranjera) x nivel_2 (Renta Fija/Variable/Derivados/Otros) x glosa (detalle).
 Reemplazan a sp_fila como fuente de /asset-allocation (ver vistas v_asset_class_*_sd).
 
 Ventana por defecto: fecha >= 2025-01-01 (lo que el dashboard muestra).
-Idempotente: DELETE de las fechas presentes en el pull + INSERT. REST API (HTTPS/443).
+Idempotente: DELETE de las fechas presentes en el pull + INSERT.
+Destino: BigQuery (afp_raw; via sync/bq_io.py, ADC). Antes: Supabase REST.
 
 Uso:
     python sync/sync_sd_asset_class.py
@@ -56,7 +57,7 @@ def sync_one(eng, sb, src_table, dst_table, extra_cols, start):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Sync AFP_CL_01_sd/02_sd -> Supabase sd_asset_class_*",
+        description="Sync AFP_CL_01_sd/02_sd -> BigQuery sd_asset_class_*",
     )
     ap.add_argument('--start', default=WINDOW, help=f'Inicio YYYY-MM-DD (default {WINDOW})')
     args = ap.parse_args()

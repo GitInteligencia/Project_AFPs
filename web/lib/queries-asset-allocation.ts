@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { MART, query, toDateStr, toNum, toNumOrNull } from './db';
 import type {
   AssetClassByAfpRow,
   AssetClassByTipoRow,
@@ -11,19 +12,17 @@ import type {
  * Distinct fecha_valor across the asset-class views (one per published period).
  * Returned as YYYY-MM-DD strings, latest first.
  *
- * Reads from v_sp_asset_class_dates (DISTINCT fecha_valor over sp_fila cuadro
- * 1+2). Hitting v_sp_asset_class_afp directly hits PostgREST's server-side
- * max_rows=1000 cap before our .limit() takes effect: 624 rows/fecha would
- * silently cut us off after ~1.6 fechas.
+ * Reads from v_asset_class_dates_sd (DISTINCT fecha_valor over sp_fila cuadro
+ * 1+2), which is the cheap way to list periods without scanning the full
+ * afp × tipo_fondo × category view.
  */
 export async function getAssetAllocationDates(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('v_asset_class_dates_sd')
-    .select('fecha_valor')
-    .gte('fecha_valor', '2025-01-01')
-    .order('fecha_valor', { ascending: false });
-  if (error) throw error;
-  return (data ?? []).map((r) => r.fecha_valor as string);
+  const data = await query<{ fecha_valor: unknown }>(
+    `SELECT fecha_valor FROM ${MART}.v_asset_class_dates_sd
+     WHERE fecha_valor >= DATE '2025-01-01'
+     ORDER BY fecha_valor DESC`,
+  );
+  return data.map((r) => toDateStr(r.fecha_valor));
 }
 
 export async function getAssetClassByAfp(
@@ -31,37 +30,50 @@ export async function getAssetClassByAfp(
 ): Promise<AssetClassByAfpRow[]> {
   // The view is afp × tipo_fondo × category. For Sec 02 cut by AFP we want
   // the all-funds (tipo_fondo='TOTAL') aggregate per AFP.
-  const { data, error } = await supabase
-    .from('v_asset_class_afp_sd')
-    .select('afp_nombre,pdf_category,pdf_order,monto_dolares,porcentaje')
-    .eq('fecha_valor', fecha)
-    .eq('tipo_fondo', 'TOTAL');
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
+  const data = await query<{
+    afp_nombre: string;
+    pdf_category: string;
+    pdf_order: unknown;
+    monto_dolares: unknown;
+    porcentaje: unknown;
+  }>(
+    `SELECT afp_nombre, pdf_category, pdf_order, monto_dolares, porcentaje
+     FROM ${MART}.v_asset_class_afp_sd
+     WHERE fecha_valor = DATE(@fecha) AND tipo_fondo = @tipo_fondo`,
+    { fecha, tipo_fondo: 'TOTAL' },
+  );
+  return data.map((r) => ({
     afp: r.afp_nombre as string,
     pdf_category: r.pdf_category as string,
-    pdf_order: Number(r.pdf_order),
-    monto_dolares: r.monto_dolares != null ? Number(r.monto_dolares) : null,
+    pdf_order: toNum(r.pdf_order),
+    monto_dolares: r.monto_dolares != null ? toNum(r.monto_dolares) : null,
     // SP exposes porcentaje on a 0-100 scale; we normalize to 0..1 here so
     // formatters (fmtPct) can treat it like every other share in the app.
-    porcentaje: r.porcentaje != null ? Number(r.porcentaje) / 100 : null,
+    porcentaje: r.porcentaje != null ? toNum(r.porcentaje) / 100 : null,
   }));
 }
 
 export async function getAssetClassByTipo(
   fecha: string,
 ): Promise<AssetClassByTipoRow[]> {
-  const { data, error } = await supabase
-    .from('v_asset_class_tipo_sd')
-    .select('tipo_fondo,pdf_category,pdf_order,monto_dolares,porcentaje')
-    .eq('fecha_valor', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
+  const data = await query<{
+    tipo_fondo: string;
+    pdf_category: string;
+    pdf_order: unknown;
+    monto_dolares: unknown;
+    porcentaje: unknown;
+  }>(
+    `SELECT tipo_fondo, pdf_category, pdf_order, monto_dolares, porcentaje
+     FROM ${MART}.v_asset_class_tipo_sd
+     WHERE fecha_valor = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map((r) => ({
     tipo_fondo: r.tipo_fondo as string,
     pdf_category: r.pdf_category as string,
-    pdf_order: Number(r.pdf_order),
-    monto_dolares: r.monto_dolares != null ? Number(r.monto_dolares) : null,
-    porcentaje: r.porcentaje != null ? Number(r.porcentaje) / 100 : null,
+    pdf_order: toNum(r.pdf_order),
+    monto_dolares: r.monto_dolares != null ? toNum(r.monto_dolares) : null,
+    porcentaje: r.porcentaje != null ? toNum(r.porcentaje) / 100 : null,
   }));
 }
 
@@ -70,55 +82,56 @@ export async function getAssetClassByTipo(
  * sourced from SP XML Cuadro 2 — same period as the main matrix, no lag.
  */
 export async function getLocalFiByAfp(fecha: string): Promise<LocalFiRow[]> {
-  const { data, error } = await supabase
-    .from('v_local_fi_by_afp_sd')
-    .select('afp,fecha_reporte,pdf_bucket,pdf_order,monto_usd_mm')
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
+  const data = await query<{
+    afp: string;
+    fecha_reporte: unknown;
+    pdf_bucket: string;
+    pdf_order: unknown;
+    monto_usd_mm: unknown;
+  }>(
+    `SELECT afp, fecha_reporte, pdf_bucket, pdf_order, monto_usd_mm
+     FROM ${MART}.v_local_fi_by_afp_sd
+     WHERE fecha_reporte = DATE(@fecha)`,
+    { fecha },
+  );
+  return data.map((r) => ({
     afp: r.afp as string,
-    fecha_reporte: r.fecha_reporte as string,
+    fecha_reporte: toDateStr(r.fecha_reporte),
     pdf_bucket: r.pdf_bucket as string,
-    pdf_order: Number(r.pdf_order),
-    monto_usd_mm: Number(r.monto_usd_mm) || 0,
+    pdf_order: toNum(r.pdf_order),
+    monto_usd_mm: toNum(r.monto_usd_mm) || 0,
   }));
 }
 
 /**
  * Monthly evolution of asset class allocation per tipo_fondo (A-E + TOTAL).
- * Sourced from v_sp_asset_class_tipo (SP XML) — covers all months we've synced.
+ * Sourced from v_asset_class_tipo_sd (SP XML) — covers all months we've synced.
  * Returned ordered by fecha asc, then pdf_order asc.
  */
 export async function getAssetClassEvolution(): Promise<
   AssetClassEvolutionRow[]
 > {
+  const data = await query<{
+    fecha_valor: unknown;
+    tipo_fondo: string;
+    pdf_category: string;
+    pdf_order: unknown;
+    monto_dolares: unknown;
+  }>(
+    `SELECT fecha_valor, tipo_fondo, pdf_category, pdf_order, monto_dolares
+     FROM ${MART}.v_asset_class_tipo_sd
+     ORDER BY fecha_valor ASC, pdf_order ASC`,
+  );
   const rows: AssetClassEvolutionRow[] = [];
-  // Supabase REST defaults to a 1000-row limit per query. With 15 months × 90
-  // rows = 1,350 rows we'd be cut off, so we paginate.
-  let offset = 0;
-  const PAGE = 1000;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_asset_class_tipo_sd')
-      .select('fecha_valor,tipo_fondo,pdf_category,pdf_order,monto_dolares')
-      .order('fecha_valor', { ascending: true })
-      .order('pdf_order', { ascending: true })
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    for (const r of data) {
-      if (r.monto_dolares == null) continue;
-      rows.push({
-        fecha: r.fecha_valor as string,
-        tipo_fondo: r.tipo_fondo as string,
-        pdf_category: r.pdf_category as string,
-        pdf_order: Number(r.pdf_order),
-        monto_dolares: Number(r.monto_dolares),
-      });
-    }
-    if (data.length < PAGE) break;
-    offset += PAGE;
+  for (const r of data) {
+    if (r.monto_dolares == null) continue;
+    rows.push({
+      fecha: toDateStr(r.fecha_valor),
+      tipo_fondo: r.tipo_fondo as string,
+      pdf_category: r.pdf_category as string,
+      pdf_order: toNum(r.pdf_order),
+      monto_dolares: toNumOrNull(r.monto_dolares) ?? 0,
+    });
   }
   return rows;
 }
@@ -126,35 +139,31 @@ export async function getAssetClassEvolution(): Promise<
 /**
  * Monthly evolution of asset allocation per AFP (all-funds, tipo_fondo='TOTAL'),
  * including afp='TOTAL' = system. Feeds the AFP selector on the over-time chart.
- * Same pagination concern as getAssetClassEvolution (8 afps × ~13 cats × months).
  */
 export async function getAssetClassEvolutionByAfp(): Promise<
   AssetClassEvolutionByAfpRow[]
 > {
+  const data = await query<{
+    fecha_valor: unknown;
+    afp_nombre: string;
+    pdf_category: string;
+    monto_dolares: unknown;
+  }>(
+    `SELECT fecha_valor, afp_nombre, pdf_category, monto_dolares
+     FROM ${MART}.v_asset_class_afp_sd
+     WHERE tipo_fondo = @tipo_fondo
+     ORDER BY fecha_valor ASC`,
+    { tipo_fondo: 'TOTAL' },
+  );
   const rows: AssetClassEvolutionByAfpRow[] = [];
-  let offset = 0;
-  const PAGE = 1000;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data, error } = await supabase
-      .from('v_asset_class_afp_sd')
-      .select('fecha_valor,afp_nombre,pdf_category,monto_dolares')
-      .eq('tipo_fondo', 'TOTAL')
-      .order('fecha_valor', { ascending: true })
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    if (!data || data.length === 0) break;
-    for (const r of data) {
-      if (r.monto_dolares == null) continue;
-      rows.push({
-        fecha: r.fecha_valor as string,
-        afp: r.afp_nombre as string,
-        pdf_category: r.pdf_category as string,
-        monto_dolares: Number(r.monto_dolares),
-      });
-    }
-    if (data.length < PAGE) break;
-    offset += PAGE;
+  for (const r of data) {
+    if (r.monto_dolares == null) continue;
+    rows.push({
+      fecha: toDateStr(r.fecha_valor),
+      afp: r.afp_nombre as string,
+      pdf_category: r.pdf_category as string,
+      monto_dolares: toNumOrNull(r.monto_dolares) ?? 0,
+    });
   }
   return rows;
 }

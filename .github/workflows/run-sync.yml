@@ -1,0 +1,111 @@
+# Corrida manual del pipeline: ejecuta el Cloud Run job afp-sync con los MISMOS flags
+# de `python main.py` (reemplaza "abrir PowerShell en la laptop"). Espera a que termine
+# y vuelca los logs de la ejecución al resumen del workflow.
+name: run-sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: '--only: pasos separados por coma (ej. chist_adjusted,bbg_returns). Vacío = todos'
+        type: string
+        default: ''
+      start:
+        description: '--start YYYY-MM-DD: inicio explícito de la ventana (aplica también a CHIST)'
+        type: string
+        default: ''
+      months_back:
+        description: '--months-back N: meses hacia atrás para la ventana (default 3)'
+        type: string
+        default: ''
+      skip_strategy:
+        description: '--skip-strategy: omitir ipd_strategy (el paso más lento)'
+        type: boolean
+        default: false
+      keep_going:
+        description: '--keep-going: seguir con los pasos restantes aunque uno falle'
+        type: boolean
+        default: false
+      list:
+        description: '--list: sólo mostrar el plan, no ejecutar nada (prueba de humo)'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+# Una corrida a la vez: los pasos son idempotentes, pero dos corridas simultáneas
+# duplican tiempo de SQL Server y se pisan en afp_stg.
+concurrency:
+  group: run-sync
+  cancel-in-progress: false
+
+env:
+  JOB: afp-sync
+
+jobs:
+  run:
+    name: gcloud run jobs execute afp-sync
+    runs-on: ubuntu-latest
+    environment: uat
+    timeout-minutes: 200   # task-timeout del job = 3 h
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      # gcloud parte --args por coma; `--only a,b` lleva comas, así que se usa el
+      # delimitador alternativo ^|^ (sintaxis de escape de gcloud para listas).
+      - name: armar argumentos
+        id: args
+        run: |
+          A=()
+          [ -n "${{ inputs.only }}" ]        && A+=(--only "${{ inputs.only }}")
+          [ -n "${{ inputs.start }}" ]       && A+=(--start "${{ inputs.start }}")
+          [ -n "${{ inputs.months_back }}" ] && A+=(--months-back "${{ inputs.months_back }}")
+          [ "${{ inputs.skip_strategy }}" = "true" ] && A+=(--skip-strategy)
+          [ "${{ inputs.keep_going }}" = "true" ]    && A+=(--keep-going)
+          [ "${{ inputs.list }}" = "true" ]          && A+=(--list)
+          JOINED=$(IFS='|'; echo "${A[*]}")
+          echo "args=$JOINED" >> "$GITHUB_OUTPUT"
+          echo "python main.py ${A[*]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: execute --wait
+        id: exec
+        run: |
+          set -o pipefail
+          ARGS_FLAG=()
+          if [ -n "${{ steps.args.outputs.args }}" ]; then ARGS_FLAG=(--args "^|^${{ steps.args.outputs.args }}"); else ARGS_FLAG=(--args ""); fi
+          # --args "" limpia argumentos heredados de una ejecución previa (el job guarda los últimos).
+          EXEC=$(gcloud run jobs execute "$JOB" --region "${{ vars.GCP_REGION }}" "${ARGS_FLAG[@]}" \
+                   --wait --format='value(metadata.name)' 2> >(tee /dev/stderr) ) || RC=$?
+          echo "execution=$EXEC" >> "$GITHUB_OUTPUT"
+          echo "Ejecución: $EXEC (rc=${RC:-0})" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "${RC:-0}"
+
+      - name: logs de la ejecución
+        if: always() && steps.exec.outputs.execution != ''
+        run: |
+          # Cloud Logging tarda unos segundos en indexar la cola del log.
+          sleep 20
+          gcloud logging read \
+            "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$JOB\" AND labels.\"run.googleapis.com/execution_name\"=\"${{ steps.exec.outputs.execution }}\"" \
+            --project "${{ vars.GCP_PROJECT_ID }}" --order asc --limit 2000 \
+            --format='value(timestamp,severity,textPayload)' > exec.log || true
+          wc -l exec.log
+          echo '## Últimas 80 líneas del log' >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; tail -n 80 exec.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat exec.log
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.exec.outputs.execution != ''
+        with:
+          name: afp-sync-${{ steps.exec.outputs.execution }}.log
+          path: exec.log
+          if-no-files-found: ignore

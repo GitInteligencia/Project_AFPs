@@ -2,26 +2,55 @@
 
 import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
-import { getSupabaseAuthServer } from '@/lib/supabase-auth-server';
+import { cookies } from 'next/headers';
+import {
+  AuthError,
+  SESSION_COOKIE,
+  SESSION_MAX_AGE_S,
+  createSessionCookie,
+  revokeSession,
+  signInWithEmailPassword,
+} from '@/lib/auth-server';
+
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  // Browsers accept Secure cookies on http://localhost, but not on other
+  // plain-http hosts; relax only outside production so `next dev` keeps working.
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  path: '/',
+};
 
 export async function login(formData: FormData) {
   const email = String(formData.get('email') ?? '').trim();
   const password = String(formData.get('password') ?? '');
   const redirectTo = String(formData.get('redirect') ?? '/');
 
-  const supabase = await getSupabaseAuthServer();
-  const { error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) {
-    redirect(`/login?error=${encodeURIComponent(error.message)}`);
+  let sessionCookie: string;
+  try {
+    const { idToken } = await signInWithEmailPassword(email, password);
+    sessionCookie = await createSessionCookie(idToken);
+  } catch (err) {
+    const message =
+      err instanceof AuthError ? err.message : 'Sign-in failed. Please try again';
+    redirect(`/login?error=${encodeURIComponent(message)}`);
   }
+
+  const store = await cookies();
+  store.set(SESSION_COOKIE, sessionCookie, {
+    ...COOKIE_OPTIONS,
+    maxAge: SESSION_MAX_AGE_S,
+  });
 
   revalidatePath('/', 'layout');
   redirect(redirectTo);
 }
 
 export async function logout() {
-  const supabase = await getSupabaseAuthServer();
-  await supabase.auth.signOut();
+  const store = await cookies();
+  const current = store.get(SESSION_COOKIE)?.value;
+  await revokeSession(current);
+  store.set(SESSION_COOKIE, '', { ...COOKIE_OPTIONS, maxAge: 0 });
   revalidatePath('/', 'layout');
   redirect('/login');
 }

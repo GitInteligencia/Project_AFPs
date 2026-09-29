@@ -1,5 +1,26 @@
 # HANDOFF — Traspaso del proyecto AFP Chile Dashboard
 
+> ## Estado 2026-09: migración a GCP en curso
+>
+> El proyecto se está moviendo a Google Cloud (proyecto `pat-uat-global`, región
+> `southamerica-west1`): web en **Cloud Run** (`afp-web`), datos en **BigQuery**
+> (`afp_raw`/`afp_dim`/`afp_mart`/`afp_ops`/`afp_stg`), pipeline como **Cloud Run job**
+> (`afp-sync`) disparado por Cloud Scheduler los días 8 y 18 o a mano desde GitHub Actions,
+> login con Identity Platform y CI/CD en GitHub Actions. Nada del alcance funcional cambia
+> (mismas secciones, mismos números, mismos nombres de vistas).
+>
+> - **Plan y decisiones**: `PLAN_MIGRACION_GCP.md` (D1–D7, fases F0–F6, mapeo objeto por objeto).
+> - **Operación en GCP** (corrida mensual, logs, fallos, secretos, IP NAT, costos): `docs/GCP_RUNBOOK.md`.
+> - **Andamiaje e infra** (diagnóstico de permisos, ticket a infra, setup idempotente): `infra/README.md`.
+>
+> **Todo lo que sigue en este documento describe el flujo LEGACY — corrida desde la laptop
+> en red Patria + Supabase + Vercel — que sigue VIGENTE hasta el corte (F6 del plan).**
+> Mientras dure la convivencia, la corrida mensual legacy se sigue haciendo como se explica
+> abajo; en paralelo el job de GCP escribe en BigQuery y se valida la paridad. Cuando se
+> haga el corte, este contenido pasa a ser histórico y el runbook manda.
+
+---
+
 Guía para la persona que hereda el mantenimiento del proyecto, con foco en la
 **corrida mensual de actualización de datos**. Leer esto primero; el detalle
 técnico está en los documentos listados al final.
@@ -225,6 +246,9 @@ python main.py --skip-strategy               # sin ipd_strategy (más rápida)
 | Documento | Qué contiene |
 |---|---|
 | `README.md` | Visión general, stack, layout del repo |
+| `PLAN_MIGRACION_GCP.md` | **Migración a GCP**: decisiones D1–D7, fases, mapeo objeto por objeto |
+| `docs/GCP_RUNBOOK.md` | **Operación en GCP**: corrida mensual (Scheduler / run-sync), logs, fallos, secretos, IP NAT, costos |
+| `infra/README.md` | Ticket a infra, allowlist de la IP NAT, config de GitHub, fallback Cloud Build |
 | `CLAUDE.md` | Arquitectura, restricciones no obvias, comandos (el más denso; leerlo entero) |
 | `MANUAL_AFP_CL_ALTERNATIVE_ASSETS.md` | El proceso mensual legado (qué debe calcular el reporte) |
 | `LINEAGE.md` | Linaje de datos: de qué tabla/vista sale cada sección del dashboard |
@@ -235,4 +259,4 @@ python main.py --skip-strategy               # sin ipd_strategy (más rápida)
 
 ---
 
-*Generado 2026-07-09 como parte del traspaso del proyecto.*
+*Generado 2026-07-09 como parte del traspaso del proyecto. Encabezado "Estado 2026-09" y mapa de documentación actualizados el 2026-09-28 por la migración a GCP.*

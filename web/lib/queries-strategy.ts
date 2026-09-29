@@ -1,4 +1,5 @@
-import { supabase } from './supabase-server';
+// Fuente: BigQuery (antes Supabase/PostgREST)
+import { DIM, MART, query, queryOne, toDateStr, toDateStrOrNull, toNum } from './db';
 
 export type StrategyFamily = {
   family_id: number;
@@ -44,32 +45,38 @@ export async function getStrategyAfpOwUw(
   family_id: number,
 ): Promise<{ fecha: string; rows: StrategyAfpOwUwRow[] } | null> {
   // Latest CHIST report date available for this family.
-  const { data: latest, error: e1 } = await supabase
-    .from('mv_strategy_afp_ow_uw')
-    .select('fecha_reporte')
-    .eq('family_id', family_id)
-    .order('fecha_reporte', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (e1) throw e1;
-  const fecha = latest?.fecha_reporte as string | undefined;
+  const latest = await queryOne<{ fecha_reporte: unknown }>(
+    `SELECT fecha_reporte FROM ${MART}.mv_strategy_afp_ow_uw
+     WHERE family_id = @family_id
+     ORDER BY fecha_reporte DESC
+     LIMIT 1`,
+    { family_id },
+  );
+  const fecha = toDateStrOrNull(latest?.fecha_reporte) ?? undefined;
   if (!fecha) return null;
 
-  const { data, error } = await supabase
-    .from('mv_strategy_afp_ow_uw')
-    .select('afp,our_usd_mm,afp_aum_usd_mm,weight,sys_avg,ow_uw')
-    .eq('family_id', family_id)
-    .eq('fecha_reporte', fecha);
-  if (error) throw error;
+  const data = await query<{
+    afp: string;
+    our_usd_mm: unknown;
+    afp_aum_usd_mm: unknown;
+    weight: unknown;
+    sys_avg: unknown;
+    ow_uw: unknown;
+  }>(
+    `SELECT afp, our_usd_mm, afp_aum_usd_mm, weight, sys_avg, ow_uw
+     FROM ${MART}.mv_strategy_afp_ow_uw
+     WHERE family_id = @family_id AND fecha_reporte = DATE(@fecha)`,
+    { family_id, fecha },
+  );
 
-  const rows = (data ?? [])
+  const rows = data
     .map((r) => ({
       afp: r.afp as string,
-      our_usd_mm: Number(r.our_usd_mm) || 0,
-      afp_aum_usd_mm: Number(r.afp_aum_usd_mm) || 0,
-      weight: Number(r.weight) || 0,
-      sys_avg: Number(r.sys_avg) || 0,
-      ow_uw: Number(r.ow_uw) || 0,
+      our_usd_mm: toNum(r.our_usd_mm) || 0,
+      afp_aum_usd_mm: toNum(r.afp_aum_usd_mm) || 0,
+      weight: toNum(r.weight) || 0,
+      sys_avg: toNum(r.sys_avg) || 0,
+      ow_uw: toNum(r.ow_uw) || 0,
     }))
     .sort((a, b) => b.weight - a.weight);
   return { fecha, rows };
@@ -78,13 +85,17 @@ export async function getStrategyAfpOwUw(
 export async function getStrategyFamilies(): Promise<StrategyFamily[]> {
   // Pull from dim_bd_family directly (some families like 11 Local Equity DI/IF
   // have no comps and therefore don't appear in v_sp_strategy_aum).
-  const { data, error } = await supabase
-    .from('dim_bd_family')
-    .select('family_id,family_name,family_short_name')
-    .order('family_id');
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    family_id: r.family_id as number,
+  const data = await query<{
+    family_id: unknown;
+    family_name: string;
+    family_short_name: string | null;
+  }>(
+    `SELECT family_id, family_name, family_short_name
+     FROM ${DIM}.dim_bd_family
+     ORDER BY family_id ASC`,
+  );
+  return data.map((r) => ({
+    family_id: toNum(r.family_id),
     family_name: r.family_name as string,
     family_short_name: (r.family_short_name as string | null) ?? null,
   }));
@@ -103,43 +114,49 @@ export type LocalEquityPoint = {
 };
 
 export async function getLocalEquityDates(): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('v_local_equity_di_vs_if_combined')
-    .select('fecha_reporte')
-    .order('fecha_reporte', { ascending: false })
-    .limit(2000);
-  if (error) throw error;
-  return Array.from(new Set((data ?? []).map((r) => r.fecha_reporte as string)));
+  const data = await query<{ fecha_reporte: unknown }>(
+    `SELECT fecha_reporte FROM ${MART}.v_local_equity_di_vs_if_combined
+     ORDER BY fecha_reporte DESC
+     LIMIT 2000`,
+  );
+  return Array.from(new Set(data.map((r) => toDateStr(r.fecha_reporte))));
 }
 
 export async function getLocalEquityHistory(): Promise<LocalEquityPoint[]> {
-  const { data, error } = await supabase
-    .from('v_local_equity_di_vs_if_combined')
-    .select(
-      'fecha_reporte,direct_clp_bn,funds_clp_bn,funds_clp_bn_nt,total_clp_bn,total_clp_bn_nt,source',
-    )
-    .order('fecha_reporte', { ascending: true });
-  if (error) throw error;
-  return (data ?? []).map((r) => ({
-    fecha_reporte: r.fecha_reporte as string,
-    direct_clp_bn: Number(r.direct_clp_bn) || 0,
-    funds_clp_bn: Number(r.funds_clp_bn_nt) || 0,
-    funds_clp_bn_legacy: Number(r.funds_clp_bn) || 0,
-    total_clp_bn: Number(r.total_clp_bn_nt) || 0,
+  const data = await query<{
+    fecha_reporte: unknown;
+    direct_clp_bn: unknown;
+    funds_clp_bn: unknown;
+    funds_clp_bn_nt: unknown;
+    total_clp_bn: unknown;
+    total_clp_bn_nt: unknown;
+    source: string | null;
+  }>(
+    `SELECT fecha_reporte, direct_clp_bn, funds_clp_bn, funds_clp_bn_nt,
+            total_clp_bn, total_clp_bn_nt, source
+     FROM ${MART}.v_local_equity_di_vs_if_combined
+     ORDER BY fecha_reporte ASC`,
+  );
+  return data.map((r) => ({
+    fecha_reporte: toDateStr(r.fecha_reporte),
+    direct_clp_bn: toNum(r.direct_clp_bn) || 0,
+    funds_clp_bn: toNum(r.funds_clp_bn_nt) || 0,
+    funds_clp_bn_legacy: toNum(r.funds_clp_bn) || 0,
+    total_clp_bn: toNum(r.total_clp_bn_nt) || 0,
     source: (r.source as 'CHIST' | 'SP_XML') ?? 'CHIST',
   }));
 }
 
 export async function getStrategyDates(family_id: number): Promise<string[]> {
-  const { data, error } = await supabase
-    .from('v_sp_strategy_aum')
-    .select('periodo')
-    .eq('family_id', family_id)
-    .not('monto_dolares', 'is', null)
-    .gte('periodo', '2025-01')
-    .order('periodo', { ascending: false });
-  if (error) throw error;
-  return Array.from(new Set((data ?? []).map((r) => r.periodo as string)));
+  const data = await query<{ periodo: string }>(
+    `SELECT periodo FROM ${MART}.v_sp_strategy_aum
+     WHERE family_id = @family_id
+       AND monto_dolares IS NOT NULL
+       AND periodo >= @periodo_min
+     ORDER BY periodo DESC`,
+    { family_id, periodo_min: '2025-01' },
+  );
+  return Array.from(new Set(data.map((r) => r.periodo as string)));
 }
 
 /**
@@ -153,30 +170,17 @@ export async function getStrategyDetail(
   periodo: string,
   rollupAfter?: number,
 ): Promise<StrategyDetail | null> {
-  // v_sp_strategy_aum carries full history (~169 periodos) × every fund, so a
-  // busy family (e.g. EM LC 1,650 rows, Top 10 HY 2,473) blows past PostgREST's
-  // 1000-row default. Without pagination the latest periodo's rows can fall
-  // outside the first page, leaving the snapshot empty ("0 across 0 funds").
-  // We need the full set anyway for the time series, so page through it.
-  const data: Array<Record<string, unknown>> = [];
-  let offset = 0;
-  const PAGE = 1000;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const { data: page, error } = await supabase
-      .from('v_sp_strategy_aum')
-      .select(
-        'family_id,family_name,family_short_name,fund_short_name,fondo_largo,manager,periodo,monto_dolares,market_share_pct',
-      )
-      .eq('family_id', family_id)
-      .order('periodo', { ascending: true })
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    if (!page || page.length === 0) break;
-    data.push(...page);
-    if (page.length < PAGE) break;
-    offset += PAGE;
-  }
+  // v_sp_strategy_aum carries full history (~169 periodos) × every fund; we
+  // need the full set anyway for the time series. BigQuery returns it in one
+  // call (no 1000-row page cap to work around).
+  const data = await query<Record<string, unknown>>(
+    `SELECT family_id, family_name, family_short_name, fund_short_name, fondo_largo,
+            manager, periodo, monto_dolares, market_share_pct
+     FROM ${MART}.v_sp_strategy_aum
+     WHERE family_id = @family_id
+     ORDER BY periodo ASC`,
+    { family_id },
+  );
   if (data.length === 0) return null;
 
   const family: StrategyFamily = {
@@ -192,8 +196,8 @@ export async function getStrategyDetail(
       fund_short_name: r.fund_short_name as string,
       fondo_largo: (r.fondo_largo as string | null) ?? null,
       manager: (r.manager as string | null) ?? null,
-      monto_usd_mm: Number(r.monto_dolares) || 0,
-      market_share_pct: Number(r.market_share_pct) || 0,
+      monto_usd_mm: toNum(r.monto_dolares) || 0,
+      market_share_pct: toNum(r.market_share_pct) || 0,
     }))
     .sort((a, b) => b.monto_usd_mm - a.monto_usd_mm);
 
@@ -203,8 +207,8 @@ export async function getStrategyDetail(
     .map((r) => ({
       periodo: r.periodo as string,
       fund_short_name: r.fund_short_name as string,
-      monto_usd_mm: Number(r.monto_dolares) || 0,
-      market_share_pct: Number(r.market_share_pct) || 0,
+      monto_usd_mm: toNum(r.monto_dolares) || 0,
+      market_share_pct: toNum(r.market_share_pct) || 0,
     }))
     .sort((a, b) => a.periodo.localeCompare(b.periodo));
 
