@@ -27,12 +27,33 @@ env:
   AR_REPO: afp
 
 jobs:
+  preflight:
+    # Hasta que infra cree el pool WIF y se carguen GCP_WIF_PROVIDER / GCP_DEPLOY_SA en
+    # GitHub (infra/README.md §ticket), el deploy se OMITE (skipped, no failed).
+    name: secrets WIF presentes?
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.chk.outputs.ready }}
+    steps:
+      - id: chk
+        env:
+          WIF: ${{ secrets.GCP_WIF_PROVIDER }}
+          SA: ${{ secrets.GCP_DEPLOY_SA }}
+        run: |
+          if [ -n "$WIF" ] && [ -n "$SA" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP_WIF_PROVIDER / GCP_DEPLOY_SA no configurados: deploy omitido (ver infra/README.md)."
+          fi
+
   deploy:
     name: build & deploy afp-web
+    needs: preflight
     runs-on: ubuntu-latest
     environment: uat
     # Un PR desde un fork no tiene secrets: sólo PRs del mismo repo hacen preview.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: needs.preflight.outputs.ready == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
 

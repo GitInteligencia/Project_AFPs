@@ -26,8 +26,30 @@ env:
   AR_REPO: afp
 
 jobs:
+  preflight:
+    # Hasta que infra cree el pool WIF y se carguen GCP_WIF_PROVIDER / GCP_DEPLOY_SA en
+    # GitHub (infra/README.md §ticket), el deploy se OMITE (skipped, no failed).
+    name: secrets WIF presentes?
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.chk.outputs.ready }}
+    steps:
+      - id: chk
+        env:
+          WIF: ${{ secrets.GCP_WIF_PROVIDER }}
+          SA: ${{ secrets.GCP_DEPLOY_SA }}
+        run: |
+          if [ -n "$WIF" ] && [ -n "$SA" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GCP_WIF_PROVIDER / GCP_DEPLOY_SA no configurados: deploy omitido (ver infra/README.md)."
+          fi
+
   deploy:
     name: build & deploy afp-sync
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
     runs-on: ubuntu-latest
     environment: uat
     steps:
